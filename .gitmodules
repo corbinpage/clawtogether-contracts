@@ -1,0 +1,6 @@
+[submodule "lib/forge-std"]
+	path = lib/forge-std
+	url = https://github.com/foundry-rs/forge-std
+[submodule "lib/boring-vault"]
+	path = lib/boring-vault
+	url = https://github.com/Se7en-Seas/boring-vault

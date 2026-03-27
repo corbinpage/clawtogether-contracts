@@ -1,0 +1,16 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+auto_detect_solc = true
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 200
+
+remappings = [
+    "@solmate/=lib/boring-vault/lib/solmate/src/",
+    "@openzeppelin/=lib/boring-vault/lib/openzeppelin-contracts/",
+    "@forge-std/=lib/forge-std/src/",
+    "boring-vault/=lib/boring-vault/src/",
+    "src/interfaces/=lib/boring-vault/src/interfaces/",
+]
