@@ -12,5 +12,6 @@ remappings = [
     "@openzeppelin/=lib/boring-vault/lib/openzeppelin-contracts/",
     "@forge-std/=lib/forge-std/src/",
     "boring-vault/=lib/boring-vault/src/",
+    "src/base/=lib/boring-vault/src/base/",
     "src/interfaces/=lib/boring-vault/src/interfaces/",
 ]

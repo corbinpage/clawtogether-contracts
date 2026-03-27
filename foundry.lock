@@ -1,0 +1,8 @@
+{
+  "lib/boring-vault": {
+    "rev": "0e23e7fd3a9a7735bd3fea61dd33c1700e75c528"
+  },
+  "lib/forge-std": {
+    "rev": "50fbb2ca69a24b8991771787dfa023c0429584e5"
+  }
+}
