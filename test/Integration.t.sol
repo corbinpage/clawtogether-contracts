@@ -198,7 +198,7 @@ contract IntegrationTest is Test {
         auth.setUserRole(owner, OWNER_ROLE, true);
         auth.setRoleCapability(OWNER_ROLE, address(distributor), GameRewardsDistributor.setProtocolWallet.selector, true);
         auth.setRoleCapability(OWNER_ROLE, address(distributor), GameRewardsDistributor.setFeeSplits.selector, true);
-        auth.setRoleCapability(OWNER_ROLE, address(distributor), GameRewardsDistributor.resetCheckpoint.selector, true);
+        auth.setRoleCapability(GAME_MASTER_ROLE, address(distributor), GameRewardsDistributor.resetCheckpoint.selector, true);
         auth.setRoleCapability(OWNER_ROLE, address(distributor), GameRewardsDistributor.setPaused.selector, true);
         auth.setRoleCapability(OWNER_ROLE, address(distributor), GameRewardsDistributor.adjustCheckpoint.selector, true);
         auth.setRoleCapability(OWNER_ROLE, address(distributor), GameRewardsDistributor.setMerkleProofs.selector, true);
@@ -230,7 +230,7 @@ contract IntegrationTest is Test {
         _setupMerkleTree();
 
         // Reset checkpoint after seeding
-        vm.prank(owner);
+        vm.prank(gameMaster);
         distributor.resetCheckpoint();
 
         // Give users USDC

@@ -164,12 +164,12 @@ contract DeployGameVault is Script {
         _auth.setRoleCapability(GAME_MASTER_ROLE, address(_distributor), GameRewardsDistributor.distributeRewards.selector, true);
         _auth.setRoleCapability(GAME_MASTER_ROLE, address(_distributor), GameRewardsDistributor.supplyAndCheckpoint.selector, true);
         _auth.setRoleCapability(GAME_MASTER_ROLE, address(_distributor), GameRewardsDistributor.withdrawAndCheckpoint.selector, true);
+        _auth.setRoleCapability(GAME_MASTER_ROLE, address(_distributor), GameRewardsDistributor.resetCheckpoint.selector, true);
 
         // Owner admin
         _auth.setUserRole(owner, OWNER_ROLE, true);
         _auth.setRoleCapability(OWNER_ROLE, address(_distributor), GameRewardsDistributor.setProtocolWallet.selector, true);
         _auth.setRoleCapability(OWNER_ROLE, address(_distributor), GameRewardsDistributor.setFeeSplits.selector, true);
-        _auth.setRoleCapability(OWNER_ROLE, address(_distributor), GameRewardsDistributor.resetCheckpoint.selector, true);
         _auth.setRoleCapability(OWNER_ROLE, address(_distributor), GameRewardsDistributor.setPaused.selector, true);
         _auth.setRoleCapability(OWNER_ROLE, address(_distributor), GameRewardsDistributor.adjustCheckpoint.selector, true);
         _auth.setRoleCapability(OWNER_ROLE, address(_distributor), GameRewardsDistributor.setMerkleProofs.selector, true);

@@ -201,7 +201,7 @@ contract GameRewardsDistributorTest is Test {
             OWNER_ROLE, address(distributor), GameRewardsDistributor.setFeeSplits.selector, true
         );
         rolesAuthority.setRoleCapability(
-            OWNER_ROLE, address(distributor), GameRewardsDistributor.resetCheckpoint.selector, true
+            GAME_MASTER_ROLE, address(distributor), GameRewardsDistributor.resetCheckpoint.selector, true
         );
         rolesAuthority.setRoleCapability(
             OWNER_ROLE, address(distributor), GameRewardsDistributor.setPaused.selector, true
@@ -233,7 +233,7 @@ contract GameRewardsDistributorTest is Test {
         _setupMerkleTree();
 
         // Reset checkpoint after seeding
-        vm.prank(owner);
+        vm.prank(gameMaster);
         distributor.resetCheckpoint();
     }
 
@@ -914,7 +914,7 @@ contract GameRewardsDistributorTest is Test {
     function test_resetCheckpoint() public {
         aUsdc.simulateYield(address(vault), 500e6);
         assertEq(distributor.pendingYield(), 500e6);
-        vm.prank(owner);
+        vm.prank(gameMaster);
         distributor.resetCheckpoint();
         assertEq(distributor.pendingYield(), 0);
     }
