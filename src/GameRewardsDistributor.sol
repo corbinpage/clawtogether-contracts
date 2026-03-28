@@ -282,10 +282,38 @@ contract GameRewardsDistributor is Auth {
         lastCheckpointBalance = newCheckpoint;
     }
 
-    /// @notice Adjust the checkpoint by a signed delta when deposits or withdrawals
-    ///         change the vault's aUSDC balance outside of yield accrual.
-    ///         Call with positive delta after new USDC is supplied to Aave (deposit),
-    ///         or negative delta after USDC is withdrawn from Aave (user withdrawal).
+    /// @notice Atomically supply USDC from the vault into Aave and adjust the
+    ///         checkpoint upward by the exact principal amount. Eliminates the
+    ///         race condition where a separate adjustCheckpoint tx could fail.
+    /// @dev Callable by OWNER_ROLE or OPERATOR_ROLE. The vault must already
+    ///      hold enough USDC (e.g. from a user deposit via BoringVault.enter).
+    /// @param amount Amount of USDC to supply to Aave.
+    function supplyAndCheckpoint(uint256 amount) external requiresAuth nonReentrant {
+        uint256 oldCheckpoint = lastCheckpointBalance;
+        PROXY.aaveSupplyUsdc(amount);
+        lastCheckpointBalance = oldCheckpoint + amount;
+        emit CheckpointUpdated(oldCheckpoint, lastCheckpointBalance);
+    }
+
+    /// @notice Atomically withdraw USDC from Aave, transfer it to a recipient,
+    ///         and adjust the checkpoint downward by the exact principal amount.
+    /// @dev Callable by OWNER_ROLE or OPERATOR_ROLE. Used for user withdrawals
+    ///      (NOT for yield distribution — that is handled by distributeRewards).
+    /// @param amount Amount of USDC to withdraw from Aave.
+    /// @param to     Recipient of the withdrawn USDC.
+    function withdrawAndCheckpoint(uint256 amount, address to) external requiresAuth nonReentrant {
+        if (to == address(0)) revert ZeroAddress();
+        uint256 oldCheckpoint = lastCheckpointBalance;
+        PROXY.aaveWithdrawUsdc(amount);
+        PROXY.vaultTransferUsdc(to, amount);
+        uint256 newCheckpoint = amount > oldCheckpoint ? 0 : oldCheckpoint - amount;
+        lastCheckpointBalance = newCheckpoint;
+        emit CheckpointUpdated(oldCheckpoint, newCheckpoint);
+    }
+
+    /// @notice Adjust the checkpoint by a signed delta. Use supplyAndCheckpoint
+    ///         or withdrawAndCheckpoint instead when possible — this exists as a
+    ///         manual fallback for correcting drift or reconciliation.
     /// @dev Callable by OWNER_ROLE or OPERATOR_ROLE. This ensures that user
     ///      deposits/withdrawals are not mistakenly counted as yield.
     /// @param delta Signed change to apply to the checkpoint.

@@ -106,6 +106,9 @@ contract GameRewardsDistributorTest is Test {
             DISTRIBUTOR_ROLE, address(proxy), ScopedVaultProxy.aaveWithdrawUsdc.selector, true
         );
         rolesAuthority.setRoleCapability(
+            DISTRIBUTOR_ROLE, address(proxy), ScopedVaultProxy.aaveSupplyUsdc.selector, true
+        );
+        rolesAuthority.setRoleCapability(
             DISTRIBUTOR_ROLE, address(proxy), ScopedVaultProxy.vaultTransferUsdc.selector, true
         );
 
@@ -132,6 +135,12 @@ contract GameRewardsDistributorTest is Test {
         rolesAuthority.setRoleCapability(
             OWNER_ROLE, address(distributor), GameRewardsDistributor.adjustCheckpoint.selector, true
         );
+        rolesAuthority.setRoleCapability(
+            OWNER_ROLE, address(distributor), GameRewardsDistributor.supplyAndCheckpoint.selector, true
+        );
+        rolesAuthority.setRoleCapability(
+            OWNER_ROLE, address(distributor), GameRewardsDistributor.withdrawAndCheckpoint.selector, true
+        );
 
         vm.stopPrank();
 
@@ -139,6 +148,9 @@ contract GameRewardsDistributorTest is Test {
         aUsdc.mint(address(vault), 1_000_000e6);
         vm.prank(address(vault));
         aUsdc.approve(address(aavePool), type(uint256).max);
+        // Also approve USDC for supply path
+        vm.prank(address(vault));
+        usdc.approve(address(aavePool), type(uint256).max);
 
         // Reset checkpoint after seeding
         vm.prank(owner);
@@ -1071,5 +1083,264 @@ contract GameRewardsDistributorTest is Test {
         vm.expectEmit(true, true, true, true);
         emit FeeSplitsUpdated(2_000, 500);
         distributor.setFeeSplits(2_000, 500);
+    }
+
+    // ========================= ATOMIC SUPPLY / WITHDRAW =========================
+
+    /// @notice supplyAndCheckpoint atomically supplies USDC to Aave and adjusts checkpoint.
+    function test_supplyAndCheckpoint_basic() public {
+        uint256 checkpointBefore = distributor.lastCheckpointBalance();
+
+        // Give the vault some USDC to supply
+        usdc.mint(address(vault), 500e6);
+
+        vm.prank(owner);
+        distributor.supplyAndCheckpoint(500e6);
+
+        // Checkpoint increased by exactly 500
+        assertEq(distributor.lastCheckpointBalance(), checkpointBefore + 500e6);
+        // No pending yield — the supply is principal, not yield
+        assertEq(distributor.pendingYield(), 0);
+    }
+
+    /// @notice withdrawAndCheckpoint atomically withdraws from Aave, sends to user, and adjusts checkpoint.
+    function test_withdrawAndCheckpoint_basic() public {
+        uint256 checkpointBefore = distributor.lastCheckpointBalance();
+        address user = address(0x123);
+
+        vm.prank(owner);
+        distributor.withdrawAndCheckpoint(200e6, user);
+
+        // Checkpoint decreased by exactly 200
+        assertEq(distributor.lastCheckpointBalance(), checkpointBefore - 200e6);
+        // User received the USDC
+        assertEq(usdc.balanceOf(user), 200e6);
+        // No pending yield
+        assertEq(distributor.pendingYield(), 0);
+    }
+
+    /// @notice Atomic supply cannot create phantom yield — the core invariant that fixes Issue 2.
+    function test_supplyAndCheckpoint_cannotCreatePhantomYield() public {
+        // Supply 5000 atomically — this is the exact scenario from Issue 2
+        usdc.mint(address(vault), 5_000e6);
+
+        vm.prank(owner);
+        distributor.supplyAndCheckpoint(5_000e6);
+
+        // Unlike the old two-tx flow, pendingYield is ALWAYS 0 after a supply
+        assertEq(distributor.pendingYield(), 0);
+
+        // distributeRewards correctly reverts — no yield to distribute
+        (address[] memory w, uint256[] memory b) = _single(winner);
+        vm.prank(gameMaster);
+        vm.expectRevert(abi.encodeWithSignature("NoYieldToDistribute()"));
+        distributor.distributeRewards(w, b);
+    }
+
+    /// @notice Multiple atomic supplies followed by yield — only yield is distributed.
+    function test_supplyAndCheckpoint_multipleSupplies_thenYield() public {
+        // Supply 1: 1000
+        usdc.mint(address(vault), 1_000e6);
+        vm.prank(owner);
+        distributor.supplyAndCheckpoint(1_000e6);
+        assertEq(distributor.pendingYield(), 0);
+
+        // Supply 2: 2000
+        usdc.mint(address(vault), 2_000e6);
+        vm.prank(owner);
+        distributor.supplyAndCheckpoint(2_000e6);
+        assertEq(distributor.pendingYield(), 0);
+
+        // Now yield accrues: 300
+        aUsdc.simulateYield(address(vault), 300e6);
+        assertEq(distributor.pendingYield(), 300e6);
+
+        // Distribute — only the 300 yield goes out
+        (address[] memory w, uint256[] memory b) = _single(winner);
+        vm.prank(gameMaster);
+        distributor.distributeRewards(w, b);
+
+        assertEq(usdc.balanceOf(winner), 240e6); // 80% of 300
+        assertEq(usdc.balanceOf(protocolWallet), 30e6); // 10% of 300
+    }
+
+    /// @notice Atomic withdraw followed by yield — only yield is distributed.
+    function test_withdrawAndCheckpoint_thenYield() public {
+        address user = address(0x123);
+
+        vm.prank(owner);
+        distributor.withdrawAndCheckpoint(500_000e6, user);
+
+        // vault principal decreased, but no phantom yield
+        assertEq(distributor.pendingYield(), 0);
+
+        // yield accrues on remaining balance
+        aUsdc.simulateYield(address(vault), 100e6);
+        assertEq(distributor.pendingYield(), 100e6);
+
+        (address[] memory w, uint256[] memory b) = _single(winner);
+        vm.prank(gameMaster);
+        distributor.distributeRewards(w, b);
+
+        assertEq(usdc.balanceOf(winner), 80e6);
+    }
+
+    /// @notice Mix of atomic supplies and withdrawals between distributions.
+    function test_supplyAndWithdraw_mixedBetweenDistributions() public {
+        address user = address(0x123);
+
+        // Round 1: yield 200
+        aUsdc.simulateYield(address(vault), 200e6);
+        (address[] memory w, uint256[] memory b) = _single(winner);
+        vm.prank(gameMaster);
+        distributor.distributeRewards(w, b);
+        assertEq(usdc.balanceOf(winner), 160e6); // 80% of 200
+
+        // Atomic supply 3000
+        usdc.mint(address(vault), 3_000e6);
+        vm.prank(owner);
+        distributor.supplyAndCheckpoint(3_000e6);
+
+        // Atomic withdraw 1000 for user
+        vm.prank(owner);
+        distributor.withdrawAndCheckpoint(1_000e6, user);
+
+        // Net principal change: +2000, no yield
+        assertEq(distributor.pendingYield(), 0);
+
+        // Round 2: yield 500
+        aUsdc.simulateYield(address(vault), 500e6);
+        assertEq(distributor.pendingYield(), 500e6);
+
+        vm.prank(gameMaster);
+        distributor.distributeRewards(w, b);
+
+        // winner: 160 + 400 = 560
+        assertEq(usdc.balanceOf(winner), 560e6);
+        // protocol: 20 + 50 = 70
+        assertEq(usdc.balanceOf(protocolWallet), 70e6);
+    }
+
+    /// @notice Stress test: 5 rounds with atomic operations between each.
+    function test_atomic_fiveRounds_stressTest() public {
+        address user = address(0x123);
+        uint256 totalYieldDistributed;
+
+        (address[] memory w, uint256[] memory b) = _single(winner);
+
+        // === Round 1: 100 yield ===
+        aUsdc.simulateYield(address(vault), 100e6);
+        vm.prank(gameMaster);
+        distributor.distributeRewards(w, b);
+        totalYieldDistributed += 100e6;
+
+        // Atomic supply 2000
+        usdc.mint(address(vault), 2_000e6);
+        vm.prank(owner);
+        distributor.supplyAndCheckpoint(2_000e6);
+
+        // === Round 2: 50 yield ===
+        aUsdc.simulateYield(address(vault), 50e6);
+        vm.prank(gameMaster);
+        distributor.distributeRewards(w, b);
+        totalYieldDistributed += 50e6;
+
+        // Atomic withdraw 500
+        vm.prank(owner);
+        distributor.withdrawAndCheckpoint(500e6, user);
+
+        // Atomic supply 1000
+        usdc.mint(address(vault), 1_000e6);
+        vm.prank(owner);
+        distributor.supplyAndCheckpoint(1_000e6);
+
+        // === Round 3: 200 yield ===
+        aUsdc.simulateYield(address(vault), 200e6);
+        vm.prank(gameMaster);
+        distributor.distributeRewards(w, b);
+        totalYieldDistributed += 200e6;
+
+        // Atomic withdraw 3000
+        vm.prank(owner);
+        distributor.withdrawAndCheckpoint(3_000e6, user);
+
+        // === Round 4: 75 yield ===
+        aUsdc.simulateYield(address(vault), 75e6);
+        vm.prank(gameMaster);
+        distributor.distributeRewards(w, b);
+        totalYieldDistributed += 75e6;
+
+        // Atomic supply 10000, withdraw 4000
+        usdc.mint(address(vault), 10_000e6);
+        vm.prank(owner);
+        distributor.supplyAndCheckpoint(10_000e6);
+        vm.prank(owner);
+        distributor.withdrawAndCheckpoint(4_000e6, user);
+
+        // === Round 5: 500 yield ===
+        aUsdc.simulateYield(address(vault), 500e6);
+        vm.prank(gameMaster);
+        distributor.distributeRewards(w, b);
+        totalYieldDistributed += 500e6;
+
+        // Total yield = 925
+        assertEq(totalYieldDistributed, 925e6);
+
+        uint256 expectedWinnerTotal = (totalYieldDistributed * 8_000) / 10_000;
+        uint256 expectedProtocolTotal = (totalYieldDistributed * 1_000) / 10_000;
+
+        assertEq(usdc.balanceOf(winner), expectedWinnerTotal);
+        assertEq(usdc.balanceOf(protocolWallet), expectedProtocolTotal);
+        assertEq(distributor.totalWinnerRewards(), expectedWinnerTotal);
+        assertEq(distributor.totalProtocolRewards(), expectedProtocolTotal);
+        assertEq(distributor.pendingYield(), 0);
+    }
+
+    /// @notice withdrawAndCheckpoint reverts on zero address.
+    function test_revert_withdrawAndCheckpoint_zeroAddress() public {
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSignature("ZeroAddress()"));
+        distributor.withdrawAndCheckpoint(100e6, address(0));
+    }
+
+    /// @notice Unauthorized caller cannot call supplyAndCheckpoint.
+    function test_revert_supplyAndCheckpoint_unauthorized() public {
+        usdc.mint(address(vault), 100e6);
+        vm.prank(gameMaster);
+        vm.expectRevert("UNAUTHORIZED");
+        distributor.supplyAndCheckpoint(100e6);
+    }
+
+    /// @notice Unauthorized caller cannot call withdrawAndCheckpoint.
+    function test_revert_withdrawAndCheckpoint_unauthorized() public {
+        vm.prank(gameMaster);
+        vm.expectRevert("UNAUTHORIZED");
+        distributor.withdrawAndCheckpoint(100e6, winner);
+    }
+
+    /// @notice withdrawAndCheckpoint correctly adjusts checkpoint for full vault withdrawal.
+    function test_withdrawAndCheckpoint_fullWithdrawal() public {
+        uint256 checkpoint = distributor.lastCheckpointBalance();
+
+        // Withdraw exactly the full vault balance
+        vm.prank(owner);
+        distributor.withdrawAndCheckpoint(checkpoint, address(0x123));
+
+        assertEq(distributor.lastCheckpointBalance(), 0);
+        assertEq(usdc.balanceOf(address(0x123)), checkpoint);
+    }
+
+    /// @notice Proxy aaveSupplyUsdc rejects zero amount.
+    function test_proxy_aaveSupplyUsdc_rejectsZero() public {
+        vm.prank(address(distributor));
+        vm.expectRevert(abi.encodeWithSignature("ScopedVaultProxy__ZeroAmount()"));
+        proxy.aaveSupplyUsdc(0);
+    }
+
+    /// @notice Proxy aaveSupplyUsdc rejects unauthorized caller.
+    function test_proxy_aaveSupplyUsdc_rejectsUnauthorized() public {
+        vm.prank(address(0xBAD));
+        vm.expectRevert("UNAUTHORIZED");
+        proxy.aaveSupplyUsdc(100e6);
     }
 }

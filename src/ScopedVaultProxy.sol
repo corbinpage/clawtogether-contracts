@@ -75,6 +75,34 @@ contract ScopedVaultProxy is Auth {
         }
     }
 
+    /// @notice Supply USDC from the vault into Aave. The vault must already
+    ///         hold enough USDC. Hardcoded to only supply USDC on behalf of the vault.
+    /// @dev Callable by DISTRIBUTOR_ROLE only.
+    /// @param amount Amount of USDC to supply to Aave.
+    function aaveSupplyUsdc(uint256 amount) external requiresAuth {
+        if (amount == 0) revert ScopedVaultProxy__ZeroAmount();
+
+        // Approve Aave Pool to pull USDC from vault
+        VAULT.manage(
+            USDC,
+            abi.encodeWithSignature("approve(address,uint256)", AAVE_POOL, amount),
+            0
+        );
+
+        // Supply USDC to Aave on behalf of vault (mints aUSDC to vault)
+        VAULT.manage(
+            AAVE_POOL,
+            abi.encodeWithSignature(
+                "supply(address,uint256,address,uint16)",
+                USDC,
+                amount,
+                address(VAULT),
+                uint16(0)
+            ),
+            0
+        );
+    }
+
     /// @notice Transfer USDC from the vault to a recipient.
     /// @dev Callable by DISTRIBUTOR_ROLE only.
     /// @param to     Recipient address.
