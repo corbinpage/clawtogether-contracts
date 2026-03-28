@@ -490,6 +490,425 @@ contract GameRewardsDistributorTest is Test {
         distributor.adjustCheckpoint(int256(100e6));
     }
 
+    // ========================= SCENARIO: DEPOSITS/WITHDRAWALS BETWEEN DISTRIBUTIONS =========================
+
+    /// @notice Core scenario: deposit between two distributions should NOT inflate yield.
+    function test_scenario_depositBetweenDistributions() public {
+        // Round 1: 500 yield accrues
+        aUsdc.simulateYield(address(vault), 500e6);
+        assertEq(distributor.pendingYield(), 500e6);
+
+        (address[] memory w, uint256[] memory b) = _single(winner);
+        vm.prank(gameMaster);
+        distributor.distributeRewards(w, b);
+
+        // winner: 80% of 500 = 400
+        // protocol: 10% of 500 = 50
+        // vault depositors: 10% of 500 = 50 (stays as aUSDC)
+        assertEq(usdc.balanceOf(winner), 400e6);
+        assertEq(usdc.balanceOf(protocolWallet), 50e6);
+        assertEq(distributor.pendingYield(), 0);
+
+        // --- Between rounds: user deposits 2000 USDC, operator supplies to Aave ---
+        aUsdc.mint(address(vault), 2_000e6); // aUSDC minted from Aave supply
+        vm.prank(owner);
+        distributor.adjustCheckpoint(int256(2_000e6));
+        assertEq(distributor.pendingYield(), 0); // deposit is NOT yield
+
+        // Round 2: 300 yield accrues ON TOP of the deposit
+        aUsdc.simulateYield(address(vault), 300e6);
+        assertEq(distributor.pendingYield(), 300e6);
+
+        address winner2 = address(0xE);
+        (address[] memory w2, uint256[] memory b2) = _single(winner2);
+        vm.prank(gameMaster);
+        distributor.distributeRewards(w2, b2);
+
+        // winner2: 80% of 300 = 240
+        // protocol: 10% of 300 = 30 (cumulative: 50 + 30 = 80)
+        assertEq(usdc.balanceOf(winner2), 240e6);
+        assertEq(usdc.balanceOf(protocolWallet), 80e6);
+        assertEq(distributor.pendingYield(), 0);
+    }
+
+    /// @notice Withdrawal between distributions should NOT create phantom negative yield.
+    function test_scenario_withdrawalBetweenDistributions() public {
+        // Round 1: 1000 yield
+        aUsdc.simulateYield(address(vault), 1000e6);
+
+        (address[] memory w, uint256[] memory b) = _single(winner);
+        vm.prank(gameMaster);
+        distributor.distributeRewards(w, b);
+
+        assertEq(usdc.balanceOf(winner), 800e6);
+        assertEq(usdc.balanceOf(protocolWallet), 100e6);
+
+        // --- Between rounds: user withdraws 5000, aUSDC burned ---
+        aUsdc.burn(address(vault), 5_000e6);
+        vm.prank(owner);
+        distributor.adjustCheckpoint(-int256(5_000e6));
+        assertEq(distributor.pendingYield(), 0);
+
+        // Round 2: 200 yield accrues on the now-smaller balance
+        aUsdc.simulateYield(address(vault), 200e6);
+        assertEq(distributor.pendingYield(), 200e6);
+
+        vm.prank(gameMaster);
+        distributor.distributeRewards(w, b);
+
+        // winner: 800 + 160 = 960
+        // protocol: 100 + 20 = 120
+        assertEq(usdc.balanceOf(winner), 960e6);
+        assertEq(usdc.balanceOf(protocolWallet), 120e6);
+    }
+
+    /// @notice Multiple deposits AND withdrawals between a single distribution.
+    function test_scenario_multipleDepositsAndWithdrawals_thenDistribute() public {
+        // Start: vault has 1M aUSDC, checkpoint = 1M
+
+        // Deposit 1: +500
+        aUsdc.mint(address(vault), 500e6);
+        vm.prank(owner);
+        distributor.adjustCheckpoint(int256(500e6));
+
+        // Withdrawal 1: -200
+        aUsdc.burn(address(vault), 200e6);
+        vm.prank(owner);
+        distributor.adjustCheckpoint(-int256(200e6));
+
+        // Deposit 2: +1000
+        aUsdc.mint(address(vault), 1_000e6);
+        vm.prank(owner);
+        distributor.adjustCheckpoint(int256(1_000e6));
+
+        // Withdrawal 2: -300
+        aUsdc.burn(address(vault), 300e6);
+        vm.prank(owner);
+        distributor.adjustCheckpoint(-int256(300e6));
+
+        // Net deposit effect: +500 -200 +1000 -300 = +1000
+        // Vault aUSDC: 1M + 1000 = 1,001,000
+        // Checkpoint:  1M + 1000 = 1,001,000
+        assertEq(distributor.pendingYield(), 0);
+
+        // NOW yield accrues: +777
+        aUsdc.simulateYield(address(vault), 777e6);
+        assertEq(distributor.pendingYield(), 777e6);
+
+        // Distribute: only the 777 yield goes out
+        (address[] memory w, uint256[] memory b) = _single(winner);
+        vm.prank(gameMaster);
+        distributor.distributeRewards(w, b);
+
+        // winner: 80% of 777 = 621.6 -> 621600000
+        // protocol: 10% of 777 = 77.7 -> 77700000
+        // vault: 10% of 777 = 77.7 -> stays
+        uint256 expectedWinner = (777e6 * 8_000) / 10_000;
+        uint256 expectedProtocol = (777e6 * 1_000) / 10_000;
+        uint256 expectedVault = 777e6 - expectedWinner - expectedProtocol;
+
+        assertEq(usdc.balanceOf(winner), expectedWinner);
+        assertEq(usdc.balanceOf(protocolWallet), expectedProtocol);
+        assertEq(distributor.totalVaultRewards(), expectedVault);
+        assertEq(distributor.pendingYield(), 0);
+    }
+
+    /// @notice Three full rounds with deposits between each. Verify cumulative tracking is exact.
+    function test_scenario_threeRounds_depositsEachTime() public {
+        uint256 cumulativeWinner;
+        uint256 cumulativeProtocol;
+        uint256 cumulativeVault;
+
+        // Round 1: 100 yield, no deposits
+        aUsdc.simulateYield(address(vault), 100e6);
+        (address[] memory w, uint256[] memory b) = _single(winner);
+        vm.prank(gameMaster);
+        distributor.distributeRewards(w, b);
+        cumulativeWinner += 80e6;
+        cumulativeProtocol += 10e6;
+        cumulativeVault += 10e6;
+        assertEq(usdc.balanceOf(winner), cumulativeWinner);
+
+        // Deposit 5000 between rounds
+        aUsdc.mint(address(vault), 5_000e6);
+        vm.prank(owner);
+        distributor.adjustCheckpoint(int256(5_000e6));
+
+        // Round 2: 250 yield
+        aUsdc.simulateYield(address(vault), 250e6);
+        vm.prank(gameMaster);
+        distributor.distributeRewards(w, b);
+        cumulativeWinner += 200e6;
+        cumulativeProtocol += 25e6;
+        cumulativeVault += 25e6;
+        assertEq(usdc.balanceOf(winner), cumulativeWinner);
+
+        // Deposit 3000 between rounds
+        aUsdc.mint(address(vault), 3_000e6);
+        vm.prank(owner);
+        distributor.adjustCheckpoint(int256(3_000e6));
+
+        // Round 3: 400 yield
+        aUsdc.simulateYield(address(vault), 400e6);
+        vm.prank(gameMaster);
+        distributor.distributeRewards(w, b);
+        cumulativeWinner += 320e6;
+        cumulativeProtocol += 40e6;
+        cumulativeVault += 40e6;
+
+        assertEq(usdc.balanceOf(winner), cumulativeWinner); // 80 + 200 + 320 = 600
+        assertEq(usdc.balanceOf(protocolWallet), cumulativeProtocol); // 10 + 25 + 40 = 75
+        assertEq(distributor.totalWinnerRewards(), cumulativeWinner);
+        assertEq(distributor.totalProtocolRewards(), cumulativeProtocol);
+        assertEq(distributor.totalVaultRewards(), cumulativeVault); // 10 + 25 + 40 = 75
+        assertEq(distributor.cumulativeRewards(winner), cumulativeWinner);
+    }
+
+    /// @notice Multi-winner distribution with deposit in between. Verify each winner gets correct share.
+    function test_scenario_multiWinner_withDepositBetween() public {
+        address winner2 = address(0xE);
+        address winner3 = address(0xF);
+
+        // Round 1: 600 yield, 3 winners at 50/30/20
+        aUsdc.simulateYield(address(vault), 600e6);
+
+        address[] memory winners = new address[](3);
+        uint256[] memory bps = new uint256[](3);
+        winners[0] = winner;
+        winners[1] = winner2;
+        winners[2] = winner3;
+        bps[0] = 5_000;
+        bps[1] = 3_000;
+        bps[2] = 2_000;
+
+        vm.prank(gameMaster);
+        distributor.distributeRewards(winners, bps);
+
+        // Winner share = 80% of 600 = 480
+        // winner:  50% of 480 = 240
+        // winner2: 30% of 480 = 144
+        // winner3: 20% of 480 = 96 (remainder: 480 - 240 - 144 = 96)
+        assertEq(usdc.balanceOf(winner), 240e6);
+        assertEq(usdc.balanceOf(winner2), 144e6);
+        assertEq(usdc.balanceOf(winner3), 96e6);
+        assertEq(usdc.balanceOf(protocolWallet), 60e6);
+
+        // Large deposit between rounds
+        aUsdc.mint(address(vault), 10_000e6);
+        vm.prank(owner);
+        distributor.adjustCheckpoint(int256(10_000e6));
+
+        // Round 2: 1000 yield, 2 winners at 70/30
+        aUsdc.simulateYield(address(vault), 1000e6);
+
+        address[] memory w2 = new address[](2);
+        uint256[] memory b2 = new uint256[](2);
+        w2[0] = winner;
+        w2[1] = winner2;
+        b2[0] = 7_000;
+        b2[1] = 3_000;
+
+        vm.prank(gameMaster);
+        distributor.distributeRewards(w2, b2);
+
+        // Winner share = 80% of 1000 = 800
+        // winner:  70% of 800 = 560
+        // winner2: 30% of 800 = 240
+        assertEq(usdc.balanceOf(winner), 240e6 + 560e6); // 800 total
+        assertEq(usdc.balanceOf(winner2), 144e6 + 240e6); // 384 total
+        assertEq(usdc.balanceOf(protocolWallet), 60e6 + 100e6); // 160 total
+    }
+
+    /// @notice Ensure that if NO yield accrues between deposit adjustments, distribution reverts.
+    function test_scenario_depositOnly_noYield_reverts() public {
+        // Multiple deposits, no yield
+        aUsdc.mint(address(vault), 1_000e6);
+        vm.prank(owner);
+        distributor.adjustCheckpoint(int256(1_000e6));
+
+        aUsdc.mint(address(vault), 2_000e6);
+        vm.prank(owner);
+        distributor.adjustCheckpoint(int256(2_000e6));
+
+        assertEq(distributor.pendingYield(), 0);
+
+        (address[] memory w, uint256[] memory b) = _single(winner);
+        vm.prank(gameMaster);
+        vm.expectRevert(abi.encodeWithSignature("NoYieldToDistribute()"));
+        distributor.distributeRewards(w, b);
+    }
+
+    /// @notice Simultaneous deposit and yield in the same "block" — only yield is distributed.
+    function test_scenario_depositAndYield_sameTime() public {
+        // Deposit 5000 and 300 yield arrive "simultaneously"
+        aUsdc.mint(address(vault), 5_300e6); // 5000 deposit + 300 yield
+
+        // Admin adjusts for the deposit portion only
+        vm.prank(owner);
+        distributor.adjustCheckpoint(int256(5_000e6));
+
+        // pendingYield should reflect the 300 yield
+        assertEq(distributor.pendingYield(), 300e6);
+
+        (address[] memory w, uint256[] memory b) = _single(winner);
+        vm.prank(gameMaster);
+        distributor.distributeRewards(w, b);
+
+        assertEq(usdc.balanceOf(winner), 240e6); // 80% of 300
+        assertEq(usdc.balanceOf(protocolWallet), 30e6); // 10% of 300
+    }
+
+    /// @notice Large withdrawal that nearly empties the vault, then small yield, then distribute.
+    function test_scenario_nearTotalWithdrawal_thenYield() public {
+        // Vault has 1M aUSDC. Withdraw 999,000.
+        aUsdc.burn(address(vault), 999_000e6);
+        vm.prank(owner);
+        distributor.adjustCheckpoint(-int256(999_000e6));
+
+        // Only 1000 aUSDC remains. Checkpoint = 1000.
+        assertEq(distributor.lastCheckpointBalance(), 1_000e6);
+        assertEq(distributor.pendingYield(), 0);
+
+        // Tiny yield: 5 USDC
+        aUsdc.simulateYield(address(vault), 5e6);
+        assertEq(distributor.pendingYield(), 5e6);
+
+        (address[] memory w, uint256[] memory b) = _single(winner);
+        vm.prank(gameMaster);
+        distributor.distributeRewards(w, b);
+
+        // winner: 80% of 5 = 4
+        // protocol: 10% of 5 = 0.5 -> 500000
+        assertEq(usdc.balanceOf(winner), 4e6);
+        assertEq(usdc.balanceOf(protocolWallet), 500_000); // 0.5 USDC
+    }
+
+    /// @notice Stress test: 5 rounds with alternating deposits/withdrawals/yield.
+    function test_scenario_fiveRounds_complexFlow() public {
+        uint256 totalYieldDistributed;
+
+        // === Round 1: 100 yield ===
+        aUsdc.simulateYield(address(vault), 100e6);
+        (address[] memory w, uint256[] memory b) = _single(winner);
+        vm.prank(gameMaster);
+        distributor.distributeRewards(w, b);
+        totalYieldDistributed += 100e6;
+
+        // Deposit 2000
+        aUsdc.mint(address(vault), 2_000e6);
+        vm.prank(owner);
+        distributor.adjustCheckpoint(int256(2_000e6));
+
+        // === Round 2: 50 yield ===
+        aUsdc.simulateYield(address(vault), 50e6);
+        vm.prank(gameMaster);
+        distributor.distributeRewards(w, b);
+        totalYieldDistributed += 50e6;
+
+        // Withdraw 500
+        aUsdc.burn(address(vault), 500e6);
+        vm.prank(owner);
+        distributor.adjustCheckpoint(-int256(500e6));
+
+        // Deposit 1000
+        aUsdc.mint(address(vault), 1_000e6);
+        vm.prank(owner);
+        distributor.adjustCheckpoint(int256(1_000e6));
+
+        // === Round 3: 200 yield ===
+        aUsdc.simulateYield(address(vault), 200e6);
+        vm.prank(gameMaster);
+        distributor.distributeRewards(w, b);
+        totalYieldDistributed += 200e6;
+
+        // Withdraw 3000
+        aUsdc.burn(address(vault), 3_000e6);
+        vm.prank(owner);
+        distributor.adjustCheckpoint(-int256(3_000e6));
+
+        // === Round 4: 75 yield ===
+        aUsdc.simulateYield(address(vault), 75e6);
+        vm.prank(gameMaster);
+        distributor.distributeRewards(w, b);
+        totalYieldDistributed += 75e6;
+
+        // Deposit 10000, Withdraw 4000 (net +6000)
+        aUsdc.mint(address(vault), 10_000e6);
+        vm.prank(owner);
+        distributor.adjustCheckpoint(int256(10_000e6));
+        aUsdc.burn(address(vault), 4_000e6);
+        vm.prank(owner);
+        distributor.adjustCheckpoint(-int256(4_000e6));
+
+        // === Round 5: 500 yield ===
+        aUsdc.simulateYield(address(vault), 500e6);
+        vm.prank(gameMaster);
+        distributor.distributeRewards(w, b);
+        totalYieldDistributed += 500e6;
+
+        // Verify totals: all yield = 100 + 50 + 200 + 75 + 500 = 925
+        assertEq(totalYieldDistributed, 925e6);
+
+        uint256 expectedWinnerTotal = (totalYieldDistributed * 8_000) / 10_000; // 740
+        uint256 expectedProtocolTotal = (totalYieldDistributed * 1_000) / 10_000; // 92.5
+
+        assertEq(usdc.balanceOf(winner), expectedWinnerTotal);
+        assertEq(usdc.balanceOf(protocolWallet), expectedProtocolTotal);
+        assertEq(distributor.totalWinnerRewards(), expectedWinnerTotal);
+        assertEq(distributor.totalProtocolRewards(), expectedProtocolTotal);
+        assertEq(distributor.pendingYield(), 0);
+    }
+
+    /// @notice Verify accounting holds with a fee split change mid-stream between deposits.
+    function test_scenario_feeSplitChange_betweenDeposits() public {
+        // Round 1: default splits (80/10/10), 1000 yield
+        aUsdc.simulateYield(address(vault), 1000e6);
+        (address[] memory w, uint256[] memory b) = _single(winner);
+        vm.prank(gameMaster);
+        distributor.distributeRewards(w, b);
+
+        assertEq(usdc.balanceOf(winner), 800e6);
+        assertEq(usdc.balanceOf(protocolWallet), 100e6);
+
+        // Deposit 5000 between rounds
+        aUsdc.mint(address(vault), 5_000e6);
+        vm.prank(owner);
+        distributor.adjustCheckpoint(int256(5_000e6));
+
+        // Change fee splits to 60/20/20
+        vm.prank(owner);
+        distributor.setFeeSplits(2_000, 2_000);
+
+        // Round 2: 500 yield
+        aUsdc.simulateYield(address(vault), 500e6);
+        vm.prank(gameMaster);
+        distributor.distributeRewards(w, b);
+
+        // winner: 60% of 500 = 300 (cumulative: 800 + 300 = 1100)
+        // protocol: 20% of 500 = 100 (cumulative: 100 + 100 = 200)
+        assertEq(usdc.balanceOf(winner), 1100e6);
+        assertEq(usdc.balanceOf(protocolWallet), 200e6);
+        assertEq(distributor.totalVaultRewards(), 100e6 + 100e6); // 10% of 1000 + 20% of 500
+    }
+
+    /// @notice Forgotten adjustCheckpoint after deposit inflates yield — shows why adjustment is critical.
+    function test_scenario_forgottenAdjust_inflatesYield() public {
+        // Deposit 5000 WITHOUT calling adjustCheckpoint
+        aUsdc.mint(address(vault), 5_000e6);
+
+        // The system thinks this is yield!
+        assertEq(distributor.pendingYield(), 5_000e6);
+
+        // If distributeRewards is called, the deposit gets distributed as "yield"
+        (address[] memory w, uint256[] memory b) = _single(winner);
+        vm.prank(gameMaster);
+        distributor.distributeRewards(w, b);
+
+        // This is WRONG behavior but proves the invariant:
+        // without adjustCheckpoint, deposits are treated as yield
+        assertEq(usdc.balanceOf(winner), 4_000e6); // 80% of 5000 (should be 0)
+    }
+
     // ========================= PAUSE =========================
 
     function test_pause_blocksDistribution() public {
