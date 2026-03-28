@@ -9,13 +9,18 @@ import {ERC20} from "@solmate/tokens/ERC20.sol";
 import {TellerWithMultiAssetSupport} from "boring-vault/base/Roles/TellerWithMultiAssetSupport.sol";
 import {AccountantWithRateProviders} from "boring-vault/base/Roles/AccountantWithRateProviders.sol";
 import {DelayedWithdraw} from "boring-vault/base/Roles/DelayedWithdraw.sol";
-import {ScopedVaultProxy} from "../src/ScopedVaultProxy.sol";
+import {ManagerWithMerkleVerification} from "boring-vault/base/Roles/ManagerWithMerkleVerification.sol";
+import {ClawTogetherDecoderAndSanitizer} from "../src/ClawTogetherDecoderAndSanitizer.sol";
 import {GameRewardsDistributor} from "../src/GameRewardsDistributor.sol";
 
 /// @title DeployGameVault
 /// @notice Deploys the full ClawTogether game vault system on Base:
 ///         BoringVault + Accountant + Teller + DelayedWithdraw +
-///         ScopedVaultProxy + GameRewardsDistributor.
+///         ManagerWithMerkleVerification + Decoder + GameRewardsDistributor.
+/// @dev After deployment, the owner must:
+///      1. Compute Merkle tree (4 leaves: approve, supply, withdraw, transfer)
+///      2. Call manager.setManageRoot(distributor, root)
+///      3. Call distributor.setMerkleProofs(...)
 contract DeployGameVault is Script {
     // ========================= BASE ADDRESSES =========================
 
@@ -26,12 +31,12 @@ contract DeployGameVault is Script {
 
     // ========================= ROLE IDs =========================
 
-    uint8 constant MANAGER_ROLE = 1;          // ScopedVaultProxy -> vault.manage()
+    uint8 constant MANAGER_ROLE = 1;          // Manager -> vault.manage()
     uint8 constant TELLER_ROLE = 2;           // Teller -> vault.enter()
     uint8 constant DELAYED_WITHDRAW_ROLE = 3; // DelayedWithdraw -> vault.exit()
     uint8 constant OWNER_ROLE = 8;            // Owner admin functions
     uint8 constant GAME_MASTER_ROLE = 20;     // GameMaster -> distributeRewards
-    uint8 constant DISTRIBUTOR_ROLE = 21;     // Distributor -> proxy scoped calls
+    uint8 constant STRATEGIST_ROLE = 21;      // Distributor -> manager.manageVaultWithMerkleVerification
 
     // ========================= CONFIGURATION =========================
 
@@ -48,225 +53,125 @@ contract DeployGameVault is Script {
     uint16 constant PLATFORM_FEE = 0;
     uint16 constant PERFORMANCE_FEE = 0;
 
+    // Shared state set during deployment for use across helper functions
+    RolesAuthority internal _auth;
+    BoringVault internal _vault;
+    ManagerWithMerkleVerification internal _manager;
+    GameRewardsDistributor internal _distributor;
+
     function run() external {
         address deployer = msg.sender;
-
         address owner = vm.envOr("OWNER", deployer);
         address protocolWallet = vm.envOr("PROTOCOL_WALLET", deployer);
         address gameMaster = vm.envOr("GAME_MASTER", deployer);
 
         vm.startBroadcast();
 
-        // 1. Deploy RolesAuthority
-        RolesAuthority rolesAuthority = new RolesAuthority(deployer, Authority(address(0)));
-        console.log("RolesAuthority:", address(rolesAuthority));
+        _deployCore(deployer, owner);
+        _deployVeda(deployer, owner);
+        _deployGame(owner, protocolWallet);
+        _setupPermissions(owner, gameMaster);
 
-        // 2. Deploy BoringVault
-        BoringVault vault = new BoringVault(deployer, "Game Yield Vault", "gyvUSDC", 6);
-        console.log("BoringVault:", address(vault));
-        vault.setAuthority(rolesAuthority);
-
-        // 3. Deploy AccountantWithRateProviders
-        AccountantWithRateProviders accountant = new AccountantWithRateProviders(
-            deployer,
-            address(vault),
-            owner,
-            STARTING_EXCHANGE_RATE,
-            address(USDC),
-            ALLOWED_RATE_CHANGE_UPPER,
-            ALLOWED_RATE_CHANGE_LOWER,
-            MIN_UPDATE_DELAY,
-            PLATFORM_FEE,
-            PERFORMANCE_FEE
-        );
-        console.log("Accountant:", address(accountant));
-
-        // 4. Deploy TellerWithMultiAssetSupport
-        TellerWithMultiAssetSupport teller = new TellerWithMultiAssetSupport(
-            deployer,
-            address(vault),
-            address(accountant),
-            WETH
-        );
-        console.log("Teller:", address(teller));
-
-        // 5. Deploy DelayedWithdraw
-        DelayedWithdraw delayedWithdraw = new DelayedWithdraw(
-            deployer,
-            address(vault),
-            address(accountant),
-            owner
-        );
-        console.log("DelayedWithdraw:", address(delayedWithdraw));
-
-        // 6. Deploy ScopedVaultProxy
-        ScopedVaultProxy proxy = new ScopedVaultProxy(
-            owner, rolesAuthority, vault, USDC, AAVE_V3_POOL
-        );
-        console.log("ScopedVaultProxy:", address(proxy));
-
-        // 7. Deploy GameRewardsDistributor
-        GameRewardsDistributor distributor = new GameRewardsDistributor(
-            owner,
-            rolesAuthority,
-            vault,
-            ERC20(USDC),
-            ERC20(A_BAS_USDC),
-            proxy,
-            protocolWallet
-        );
-        console.log("GameRewardsDistributor:", address(distributor));
-
-        // 8. Point Veda contracts to shared RolesAuthority
-        teller.setAuthority(rolesAuthority);
-        accountant.setAuthority(rolesAuthority);
-        delayedWithdraw.setAuthority(rolesAuthority);
-
-        // ========================= VAULT PERMISSIONS =========================
-
-        // ScopedVaultProxy -> vault.manage()
-        rolesAuthority.setUserRole(address(proxy), MANAGER_ROLE, true);
-        rolesAuthority.setRoleCapability(
-            MANAGER_ROLE,
-            address(vault),
-            bytes4(keccak256("manage(address,bytes,uint256)")),
-            true
-        );
-
-        // Teller -> vault.enter()
-        rolesAuthority.setUserRole(address(teller), TELLER_ROLE, true);
-        rolesAuthority.setRoleCapability(
-            TELLER_ROLE,
-            address(vault),
-            bytes4(keccak256("enter(address,address,uint256,address,uint256)")),
-            true
-        );
-
-        // DelayedWithdraw -> vault.exit()
-        rolesAuthority.setUserRole(address(delayedWithdraw), DELAYED_WITHDRAW_ROLE, true);
-        rolesAuthority.setRoleCapability(
-            DELAYED_WITHDRAW_ROLE,
-            address(vault),
-            bytes4(keccak256("exit(address,address,uint256,address,uint256)")),
-            true
-        );
-
-        // ========================= GAME ROLES =========================
-
-        // Distributor -> proxy scoped calls
-        rolesAuthority.setUserRole(address(distributor), DISTRIBUTOR_ROLE, true);
-        rolesAuthority.setRoleCapability(
-            DISTRIBUTOR_ROLE, address(proxy), ScopedVaultProxy.aaveWithdrawUsdc.selector, true
-        );
-        rolesAuthority.setRoleCapability(
-            DISTRIBUTOR_ROLE, address(proxy), ScopedVaultProxy.vaultTransferUsdc.selector, true
-        );
-
-        // GameMaster -> distributeRewards
-        rolesAuthority.setUserRole(gameMaster, GAME_MASTER_ROLE, true);
-        rolesAuthority.setRoleCapability(
-            GAME_MASTER_ROLE,
-            address(distributor),
-            GameRewardsDistributor.distributeRewards.selector,
-            true
-        );
-
-        // ========================= OWNER ADMIN =========================
-
-        rolesAuthority.setUserRole(owner, OWNER_ROLE, true);
-        rolesAuthority.setRoleCapability(
-            OWNER_ROLE, address(distributor), GameRewardsDistributor.setProtocolWallet.selector, true
-        );
-        rolesAuthority.setRoleCapability(
-            OWNER_ROLE, address(distributor), GameRewardsDistributor.setFeeSplits.selector, true
-        );
-        rolesAuthority.setRoleCapability(
-            OWNER_ROLE, address(distributor), GameRewardsDistributor.resetCheckpoint.selector, true
-        );
-        rolesAuthority.setRoleCapability(
-            OWNER_ROLE, address(distributor), GameRewardsDistributor.setPaused.selector, true
-        );
-        rolesAuthority.setRoleCapability(
-            OWNER_ROLE, address(distributor), GameRewardsDistributor.adjustCheckpoint.selector, true
-        );
-
-        // Owner admin on Teller
-        rolesAuthority.setRoleCapability(
-            OWNER_ROLE, address(teller), TellerWithMultiAssetSupport.updateAssetData.selector, true
-        );
-
-        // Owner admin on Accountant
-        rolesAuthority.setRoleCapability(
-            OWNER_ROLE, address(accountant), AccountantWithRateProviders.updateExchangeRate.selector, true
-        );
-
-        // Owner admin on DelayedWithdraw
-        rolesAuthority.setRoleCapability(
-            OWNER_ROLE, address(delayedWithdraw), DelayedWithdraw.setupWithdrawAsset.selector, true
-        );
-        rolesAuthority.setRoleCapability(
-            OWNER_ROLE, address(delayedWithdraw), DelayedWithdraw.changeWithdrawDelay.selector, true
-        );
-        rolesAuthority.setRoleCapability(
-            OWNER_ROLE, address(delayedWithdraw), DelayedWithdraw.changeMaxLoss.selector, true
-        );
-        rolesAuthority.setRoleCapability(
-            OWNER_ROLE, address(delayedWithdraw), DelayedWithdraw.pause.selector, true
-        );
-        rolesAuthority.setRoleCapability(
-            OWNER_ROLE, address(delayedWithdraw), DelayedWithdraw.unpause.selector, true
-        );
-
-        // ========================= PUBLIC CAPABILITIES =========================
-
-        rolesAuthority.setPublicCapability(
-            address(teller), TellerWithMultiAssetSupport.deposit.selector, true
-        );
-        rolesAuthority.setPublicCapability(
-            address(delayedWithdraw), DelayedWithdraw.requestWithdraw.selector, true
-        );
-        rolesAuthority.setPublicCapability(
-            address(delayedWithdraw), DelayedWithdraw.cancelWithdraw.selector, true
-        );
-        rolesAuthority.setPublicCapability(
-            address(delayedWithdraw), DelayedWithdraw.completeWithdraw.selector, true
-        );
-
-        // ========================= ASSET CONFIGURATION =========================
-
-        // Teller: USDC deposits allowed, no direct withdrawals
-        teller.updateAssetData(ERC20(USDC), true, false, 0);
-
-        // Set Teller as vault's beforeTransferHook
-        vault.setBeforeTransferHook(address(teller));
-
-        // DelayedWithdraw: USDC with 1-day delay
-        delayedWithdraw.setupWithdrawAsset(
-            ERC20(USDC), WITHDRAW_DELAY, COMPLETION_WINDOW, WITHDRAW_FEE, MAX_LOSS
-        );
-        delayedWithdraw.setPullFundsFromVault(true);
-
-        // ========================= TRANSFER OWNERSHIP =========================
-
-        vault.transferOwnership(owner);
-        teller.transferOwnership(owner);
-        accountant.transferOwnership(owner);
-        delayedWithdraw.transferOwnership(owner);
-        rolesAuthority.transferOwnership(owner);
+        // Transfer ownership
+        _vault.transferOwnership(owner);
+        _auth.transferOwnership(owner);
+        _manager.transferOwnership(owner);
 
         vm.stopBroadcast();
 
         console.log("");
         console.log("=== Deployment Summary ===");
         console.log("Owner:", owner);
-        console.log("Protocol Wallet:", protocolWallet);
-        console.log("Game Master:", gameMaster);
-        console.log("");
-        console.log("User flow:");
-        console.log("  Deposit:  User -> Teller.deposit(USDC) -> vault mints gyvUSDC shares");
-        console.log("  Withdraw: User -> DelayedWithdraw.requestWithdraw() -> wait 1 day -> completeWithdraw()");
-        console.log("");
-        console.log("Game flow:");
-        console.log("  GameMaster -> Distributor -> ScopedProxy -> Vault");
+        console.log("POST-DEPLOY: Owner must compute Merkle tree and call:");
+        console.log("  1. manager.setManageRoot(distributor, merkleRoot)");
+        console.log("  2. distributor.setMerkleProofs(approve, supply, withdraw, transfer)");
+    }
+
+    function _deployCore(address deployer, address owner) internal {
+        _auth = new RolesAuthority(deployer, Authority(address(0)));
+        _vault = new BoringVault(deployer, "Game Yield Vault", "gyvUSDC", 6);
+        _vault.setAuthority(_auth);
+
+        _manager = new ManagerWithMerkleVerification(deployer, address(_vault), address(0));
+        _manager.setAuthority(_auth);
+
+        console.log("RolesAuthority:", address(_auth));
+        console.log("BoringVault:", address(_vault));
+        console.log("Manager:", address(_manager));
+    }
+
+    function _deployVeda(address deployer, address owner) internal {
+        AccountantWithRateProviders accountant = new AccountantWithRateProviders(
+            deployer, address(_vault), owner, STARTING_EXCHANGE_RATE, address(USDC),
+            ALLOWED_RATE_CHANGE_UPPER, ALLOWED_RATE_CHANGE_LOWER, MIN_UPDATE_DELAY, PLATFORM_FEE, PERFORMANCE_FEE
+        );
+        TellerWithMultiAssetSupport teller = new TellerWithMultiAssetSupport(
+            deployer, address(_vault), address(accountant), WETH
+        );
+        DelayedWithdraw delayedWithdraw = new DelayedWithdraw(deployer, address(_vault), address(accountant), owner);
+
+        teller.setAuthority(_auth);
+        accountant.setAuthority(_auth);
+        delayedWithdraw.setAuthority(_auth);
+
+        // Teller permissions
+        _auth.setUserRole(address(teller), TELLER_ROLE, true);
+        _auth.setRoleCapability(TELLER_ROLE, address(_vault), bytes4(keccak256("enter(address,address,uint256,address,uint256)")), true);
+        _auth.setPublicCapability(address(teller), TellerWithMultiAssetSupport.deposit.selector, true);
+        teller.updateAssetData(ERC20(USDC), true, false, 0);
+        _vault.setBeforeTransferHook(address(teller));
+
+        // DelayedWithdraw permissions
+        _auth.setUserRole(address(delayedWithdraw), DELAYED_WITHDRAW_ROLE, true);
+        _auth.setRoleCapability(DELAYED_WITHDRAW_ROLE, address(_vault), bytes4(keccak256("exit(address,address,uint256,address,uint256)")), true);
+        _auth.setPublicCapability(address(delayedWithdraw), DelayedWithdraw.requestWithdraw.selector, true);
+        _auth.setPublicCapability(address(delayedWithdraw), DelayedWithdraw.cancelWithdraw.selector, true);
+        _auth.setPublicCapability(address(delayedWithdraw), DelayedWithdraw.completeWithdraw.selector, true);
+        delayedWithdraw.setupWithdrawAsset(ERC20(USDC), WITHDRAW_DELAY, COMPLETION_WINDOW, WITHDRAW_FEE, MAX_LOSS);
+        delayedWithdraw.setPullFundsFromVault(true);
+
+        teller.transferOwnership(owner);
+        accountant.transferOwnership(owner);
+        delayedWithdraw.transferOwnership(owner);
+
+        console.log("Accountant:", address(accountant));
+        console.log("Teller:", address(teller));
+        console.log("DelayedWithdraw:", address(delayedWithdraw));
+    }
+
+    function _deployGame(address owner, address protocolWallet) internal {
+        ClawTogetherDecoderAndSanitizer decoder = new ClawTogetherDecoderAndSanitizer(address(_vault));
+
+        _distributor = new GameRewardsDistributor(
+            owner, _auth, _vault, ERC20(USDC), ERC20(A_BAS_USDC), _manager, address(decoder), AAVE_V3_POOL, protocolWallet
+        );
+
+        console.log("Decoder:", address(decoder));
+        console.log("GameRewardsDistributor:", address(_distributor));
+    }
+
+    function _setupPermissions(address owner, address gameMaster) internal {
+        // Manager -> vault.manage()
+        _auth.setUserRole(address(_manager), MANAGER_ROLE, true);
+        _auth.setRoleCapability(MANAGER_ROLE, address(_vault), bytes4(keccak256("manage(address,bytes,uint256)")), true);
+
+        // Distributor -> manager
+        _auth.setUserRole(address(_distributor), STRATEGIST_ROLE, true);
+        _auth.setRoleCapability(STRATEGIST_ROLE, address(_manager), ManagerWithMerkleVerification.manageVaultWithMerkleVerification.selector, true);
+
+        // GameMaster -> distributeRewards
+        _auth.setUserRole(gameMaster, GAME_MASTER_ROLE, true);
+        _auth.setRoleCapability(GAME_MASTER_ROLE, address(_distributor), GameRewardsDistributor.distributeRewards.selector, true);
+
+        // Owner admin
+        _auth.setUserRole(owner, OWNER_ROLE, true);
+        _auth.setRoleCapability(OWNER_ROLE, address(_distributor), GameRewardsDistributor.setProtocolWallet.selector, true);
+        _auth.setRoleCapability(OWNER_ROLE, address(_distributor), GameRewardsDistributor.setFeeSplits.selector, true);
+        _auth.setRoleCapability(OWNER_ROLE, address(_distributor), GameRewardsDistributor.resetCheckpoint.selector, true);
+        _auth.setRoleCapability(OWNER_ROLE, address(_distributor), GameRewardsDistributor.setPaused.selector, true);
+        _auth.setRoleCapability(OWNER_ROLE, address(_distributor), GameRewardsDistributor.adjustCheckpoint.selector, true);
+        _auth.setRoleCapability(OWNER_ROLE, address(_distributor), GameRewardsDistributor.setMerkleProofs.selector, true);
+        _auth.setRoleCapability(OWNER_ROLE, address(_distributor), GameRewardsDistributor.supplyAndCheckpoint.selector, true);
+        _auth.setRoleCapability(OWNER_ROLE, address(_distributor), GameRewardsDistributor.withdrawAndCheckpoint.selector, true);
     }
 }

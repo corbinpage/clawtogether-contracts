@@ -2,15 +2,19 @@
 pragma solidity ^0.8.21;
 
 import {BoringVault} from "boring-vault/base/BoringVault.sol";
-import {ScopedVaultProxy} from "./ScopedVaultProxy.sol";
+import {ManagerWithMerkleVerification} from "boring-vault/base/Roles/ManagerWithMerkleVerification.sol";
 import {ERC20} from "@solmate/tokens/ERC20.sol";
+import {SafeTransferLib} from "@solmate/utils/SafeTransferLib.sol";
 import {Auth, Authority} from "@solmate/auth/Auth.sol";
 
 /// @title GameRewardsDistributor
 /// @notice Distributes accrued Aave yield from a BoringVault to up to 10 game
-///         winners, a protocol wallet, and vault depositors. Designed to sit
-///         alongside Veda's Boring Vault architecture on Base.
+///         winners, a protocol wallet, and vault depositors. Uses Veda's
+///         ManagerWithMerkleVerification for scoped vault operations with a
+///         4-leaf Merkle tree (approve, supply, withdraw, transfer-to-self).
 contract GameRewardsDistributor is Auth {
+    using SafeTransferLib for ERC20;
+
     // ========================= ERRORS =========================
 
     error InvalidBps();
@@ -21,6 +25,7 @@ contract GameRewardsDistributor is Auth {
     error TooManyWinners();
     error ArrayLengthMismatch();
     error WinnerBpsMustTotal10000();
+    error MerkleProofsNotSet();
 
     // ========================= EVENTS =========================
 
@@ -35,6 +40,7 @@ contract GameRewardsDistributor is Auth {
     event FeeSplitsUpdated(uint256 protocolBps, uint256 vaultBps);
     event CheckpointUpdated(uint256 oldCheckpoint, uint256 newCheckpoint);
     event PauseToggled(bool isPaused);
+    event MerkleProofsSet();
 
     // ========================= CONSTANTS =========================
 
@@ -48,7 +54,9 @@ contract GameRewardsDistributor is Auth {
     BoringVault public immutable VAULT;
     ERC20 public immutable USDC;
     ERC20 public immutable A_USDC;
-    ScopedVaultProxy public immutable PROXY;
+    ManagerWithMerkleVerification public immutable MANAGER;
+    address public immutable DECODER;
+    address public immutable AAVE_POOL;
 
     // ========================= STATE =========================
 
@@ -62,7 +70,6 @@ contract GameRewardsDistributor is Auth {
     uint256 public vaultBps = 1_000; // 10%
 
     /// @notice aUSDC balance of the vault at last checkpoint.
-    ///         Updated on: distributeRewards, resetCheckpoint, adjustCheckpoint.
     uint256 public lastCheckpointBalance;
 
     /// @notice Pause flag for distributeRewards.
@@ -71,24 +78,25 @@ contract GameRewardsDistributor is Auth {
     /// @notice Reentrancy lock.
     uint256 private _locked = 1;
 
+    // ========================= MERKLE PROOF STORAGE =========================
+
+    /// @notice Stored Merkle proofs for the 4 allowed vault operations.
+    ///         Set once via setMerkleProofs after deployment and Merkle root setup.
+    bytes32[] private _approveProof;
+    bytes32[] private _supplyProof;
+    bytes32[] private _withdrawProof;
+    bytes32[] private _transferProof;
+
+    /// @notice Whether Merkle proofs have been initialized.
+    bool public merkleProofsSet;
+
     // ========================= REWARD TRACKING =========================
 
-    /// @notice Cumulative rewards received by each address (winner or protocol).
     mapping(address => uint256) public cumulativeRewards;
-
-    /// @notice Ordered list of unique addresses that have received rewards.
     address[] private _rewardRecipients;
-
-    /// @notice Whether an address is already in the _rewardRecipients array.
     mapping(address => bool) private _isRecipient;
-
-    /// @notice Total rewards distributed to all winners across all rounds.
     uint256 public totalWinnerRewards;
-
-    /// @notice Total rewards distributed to the protocol wallet across all rounds.
     uint256 public totalProtocolRewards;
-
-    /// @notice Total rewards accrued to vault depositors across all rounds.
     uint256 public totalVaultRewards;
 
     // ========================= MODIFIERS =========================
@@ -112,7 +120,9 @@ contract GameRewardsDistributor is Auth {
     /// @param _vault           The BoringVault holding the Aave position.
     /// @param _usdc            USDC token address on Base.
     /// @param _aUsdc           aBasUSDC token address on Base.
-    /// @param _proxy           The ScopedVaultProxy for tightly scoped vault calls.
+    /// @param _manager         The ManagerWithMerkleVerification for scoped vault calls.
+    /// @param _decoder         The ClawTogetherDecoderAndSanitizer address.
+    /// @param _aavePool        The Aave V3 Pool address on Base.
     /// @param _protocolWallet  Initial protocol wallet address.
     constructor(
         address _owner,
@@ -120,12 +130,15 @@ contract GameRewardsDistributor is Auth {
         BoringVault _vault,
         ERC20 _usdc,
         ERC20 _aUsdc,
-        ScopedVaultProxy _proxy,
+        ManagerWithMerkleVerification _manager,
+        address _decoder,
+        address _aavePool,
         address _protocolWallet
     ) Auth(_owner, _authority) {
         if (
             address(_vault) == address(0) || address(_usdc) == address(0) || address(_aUsdc) == address(0)
-                || address(_proxy) == address(0) || _protocolWallet == address(0)
+                || address(_manager) == address(0) || _decoder == address(0) || _aavePool == address(0)
+                || _protocolWallet == address(0)
         ) {
             revert ZeroAddress();
         }
@@ -133,31 +146,51 @@ contract GameRewardsDistributor is Auth {
         VAULT = _vault;
         USDC = _usdc;
         A_USDC = _aUsdc;
-        PROXY = _proxy;
+        MANAGER = _manager;
+        DECODER = _decoder;
+        AAVE_POOL = _aavePool;
         protocolWallet = _protocolWallet;
 
         lastCheckpointBalance = _aUsdc.balanceOf(address(_vault));
     }
 
+    // ========================= MERKLE PROOF SETUP =========================
+
+    /// @notice Store the Merkle proofs for the 4 allowed vault operations.
+    ///         Must be called after the Merkle root is set on the Manager.
+    /// @dev Callable by OWNER_ROLE. The proofs correspond to these leaves:
+    ///      - approve:  USDC.approve(AAVE_POOL, amount)
+    ///      - supply:   AAVE_POOL.supply(USDC, amount, VAULT, 0)
+    ///      - withdraw: AAVE_POOL.withdraw(USDC, amount, VAULT)
+    ///      - transfer: USDC.transfer(distributor, amount)
+    function setMerkleProofs(
+        bytes32[] calldata approveProof,
+        bytes32[] calldata supplyProof,
+        bytes32[] calldata withdrawProof,
+        bytes32[] calldata transferProof
+    ) external requiresAuth {
+        _approveProof = approveProof;
+        _supplyProof = supplyProof;
+        _withdrawProof = withdrawProof;
+        _transferProof = transferProof;
+        merkleProofsSet = true;
+        emit MerkleProofsSet();
+    }
+
     // ========================= GAME MASTER =========================
 
     /// @notice Distributes accrued Aave yield since the last checkpoint.
-    /// @dev Callable by GAME_MASTER_ROLE (set via RolesAuthority).
-    ///      The total winner share is (BPS_DENOMINATOR - protocolBps - vaultBps).
-    ///      That share is then split among `winners` according to `winnerBps`.
-    /// @param winners   Array of winner addresses (max 10).
-    /// @param winnerBps Array of bps values that must sum to 10000. Each entry
-    ///                  specifies what % of the total winner share goes to that winner.
+    /// @dev Flow: Aave → vault (withdraw) → distributor (transfer) → winners/protocol (direct).
     function distributeRewards(address[] calldata winners, uint256[] calldata winnerBps)
         external
         requiresAuth
         nonReentrant
         whenNotPaused
     {
+        if (!merkleProofsSet) revert MerkleProofsNotSet();
         if (winners.length == 0 || winners.length > MAX_WINNERS) revert TooManyWinners();
         if (winners.length != winnerBps.length) revert ArrayLengthMismatch();
 
-        // Validate winner bps sum to 10000
         {
             uint256 bpsSum;
             for (uint256 i; i < winners.length; ++i) {
@@ -184,10 +217,8 @@ contract GameRewardsDistributor is Auth {
             lastCheckpointBalance = expectedNewCheckpoint;
         }
 
-        // Calculate per-winner amounts
         uint256[] memory winnerAmounts = _calcWinnerAmounts(winners.length, winnerBps, totalWinnerAmount);
 
-        // Track rewards
         for (uint256 i; i < winners.length; ++i) {
             _recordReward(winners[i], winnerAmounts[i]);
         }
@@ -196,14 +227,12 @@ contract GameRewardsDistributor is Auth {
         totalProtocolRewards += protocolAmount;
         totalVaultRewards += vaultAmount;
 
-        // --- Interactions: external calls via scoped proxy ---
+        // --- Interactions ---
         _executeTransfers(winners, winnerAmounts, protocolAmount);
 
         emit RewardsDistributed(winners, winnerAmounts, protocolAmount, vaultAmount, totalYield);
     }
 
-    /// @dev Calculates per-winner amounts from bps splits. Last winner gets
-    ///      remainder to avoid dust from rounding.
     function _calcWinnerAmounts(
         uint256 count,
         uint256[] calldata winnerBps,
@@ -221,120 +250,96 @@ contract GameRewardsDistributor is Auth {
         }
     }
 
-    /// @dev Withdraws from Aave and transfers USDC to winners and protocol wallet.
+    /// @dev Withdraws from Aave via Manager, transfers USDC to this contract,
+    ///      then distributes directly to winners and protocol wallet.
     function _executeTransfers(
         address[] calldata winners,
         uint256[] memory winnerAmounts,
         uint256 protocolAmount
     ) internal {
-        // Step 1: Withdraw from Aave
         uint256 withdrawAmount;
         for (uint256 i; i < winnerAmounts.length; ++i) {
             withdrawAmount += winnerAmounts[i];
         }
         withdrawAmount += protocolAmount;
-        PROXY.aaveWithdrawUsdc(withdrawAmount);
 
-        // Step 2: Transfer each winner's share
+        // Step 1: Via Manager — withdraw from Aave + transfer USDC to this contract
+        _managerWithdrawAndTransferToSelf(withdrawAmount);
+
+        // Step 2: Direct ERC20 transfers from this contract to recipients
         for (uint256 i; i < winners.length; ++i) {
             if (winnerAmounts[i] > 0) {
-                PROXY.vaultTransferUsdc(winners[i], winnerAmounts[i]);
+                USDC.safeTransfer(winners[i], winnerAmounts[i]);
             }
         }
-
-        // Step 3: Transfer protocol's share
         if (protocolAmount > 0) {
-            PROXY.vaultTransferUsdc(protocolWallet, protocolAmount);
+            USDC.safeTransfer(protocolWallet, protocolAmount);
         }
     }
 
     // ========================= ADMIN =========================
 
-    /// @notice Update the protocol wallet address.
-    /// @dev Callable by OWNER_ROLE.
     function setProtocolWallet(address _protocolWallet) external requiresAuth {
         if (_protocolWallet == address(0)) revert ZeroAddress();
         emit ProtocolWalletUpdated(protocolWallet, _protocolWallet);
         protocolWallet = _protocolWallet;
     }
 
-    /// @notice Update the fee split between protocol and vault depositors.
-    /// @dev The winners always get (10000 - protocolBps - vaultBps) collectively.
-    ///      Callable by OWNER_ROLE.
-    /// @param _protocolBps Basis points for the protocol wallet.
-    /// @param _vaultBps    Basis points that stay in the vault for depositors.
     function setFeeSplits(uint256 _protocolBps, uint256 _vaultBps) external requiresAuth {
         if (_protocolBps > MAX_PROTOCOL_BPS) revert InvalidBps();
         if (_vaultBps > MAX_VAULT_BPS) revert InvalidBps();
         if (_protocolBps + _vaultBps >= BPS_DENOMINATOR) revert InvalidBps();
-
         protocolBps = _protocolBps;
         vaultBps = _vaultBps;
-
         emit FeeSplitsUpdated(_protocolBps, _vaultBps);
     }
 
-    /// @notice Manually reset the checkpoint to the current aUSDC balance.
-    /// @dev Callable by OWNER_ROLE.
     function resetCheckpoint() external requiresAuth {
         uint256 newCheckpoint = A_USDC.balanceOf(address(VAULT));
         emit CheckpointUpdated(lastCheckpointBalance, newCheckpoint);
         lastCheckpointBalance = newCheckpoint;
     }
 
-    /// @notice Atomically supply USDC from the vault into Aave and adjust the
-    ///         checkpoint upward by the exact principal amount. Eliminates the
-    ///         race condition where a separate adjustCheckpoint tx could fail.
-    /// @dev Callable by OWNER_ROLE or OPERATOR_ROLE. The vault must already
-    ///      hold enough USDC (e.g. from a user deposit via BoringVault.enter).
-    /// @param amount Amount of USDC to supply to Aave.
+    /// @notice Atomically supply USDC from the vault into Aave and adjust checkpoint.
     function supplyAndCheckpoint(uint256 amount) external requiresAuth nonReentrant {
+        if (!merkleProofsSet) revert MerkleProofsNotSet();
         uint256 oldCheckpoint = lastCheckpointBalance;
-        PROXY.aaveSupplyUsdc(amount);
+        _managerApproveAndSupply(amount);
         lastCheckpointBalance = oldCheckpoint + amount;
         emit CheckpointUpdated(oldCheckpoint, lastCheckpointBalance);
     }
 
-    /// @notice Atomically withdraw USDC from Aave, transfer it to a recipient,
-    ///         and adjust the checkpoint downward by the exact principal amount.
-    /// @dev Callable by OWNER_ROLE or OPERATOR_ROLE. Used for user withdrawals
-    ///      (NOT for yield distribution — that is handled by distributeRewards).
-    /// @param amount Amount of USDC to withdraw from Aave.
-    /// @param to     Recipient of the withdrawn USDC.
+    /// @notice Atomically withdraw USDC from Aave, send to recipient, and adjust checkpoint.
     function withdrawAndCheckpoint(uint256 amount, address to) external requiresAuth nonReentrant {
+        if (!merkleProofsSet) revert MerkleProofsNotSet();
         if (to == address(0)) revert ZeroAddress();
         uint256 oldCheckpoint = lastCheckpointBalance;
-        PROXY.aaveWithdrawUsdc(amount);
-        PROXY.vaultTransferUsdc(to, amount);
+
+        // Withdraw from Aave + transfer to this contract via Manager
+        _managerWithdrawAndTransferToSelf(amount);
+
+        // Direct transfer from this contract to recipient
+        USDC.safeTransfer(to, amount);
+
         uint256 newCheckpoint = amount > oldCheckpoint ? 0 : oldCheckpoint - amount;
         lastCheckpointBalance = newCheckpoint;
         emit CheckpointUpdated(oldCheckpoint, newCheckpoint);
     }
 
-    /// @notice Adjust the checkpoint by a signed delta. Use supplyAndCheckpoint
-    ///         or withdrawAndCheckpoint instead when possible — this exists as a
-    ///         manual fallback for correcting drift or reconciliation.
-    /// @dev Callable by OWNER_ROLE or OPERATOR_ROLE. This ensures that user
-    ///      deposits/withdrawals are not mistakenly counted as yield.
-    /// @param delta Signed change to apply to the checkpoint.
+    /// @notice Manual fallback for correcting drift or reconciliation.
     function adjustCheckpoint(int256 delta) external requiresAuth {
         uint256 oldCheckpoint = lastCheckpointBalance;
         uint256 newCheckpoint;
-
         if (delta >= 0) {
             newCheckpoint = oldCheckpoint + uint256(delta);
         } else {
             uint256 absDelta = uint256(-delta);
-            // If withdrawal exceeds checkpoint (shouldn't happen), floor to 0
             newCheckpoint = absDelta > oldCheckpoint ? 0 : oldCheckpoint - absDelta;
         }
-
         emit CheckpointUpdated(oldCheckpoint, newCheckpoint);
         lastCheckpointBalance = newCheckpoint;
     }
 
-    /// @notice Pause or unpause reward distribution.
-    /// @dev Callable by OWNER_ROLE.
     function setPaused(bool _isPaused) external requiresAuth {
         isPaused = _isPaused;
         emit PauseToggled(_isPaused);
@@ -342,20 +347,16 @@ contract GameRewardsDistributor is Auth {
 
     // ========================= VIEW =========================
 
-    /// @notice Returns the yield accrued since the last checkpoint.
     function pendingYield() external view returns (uint256) {
         uint256 currentBalance = A_USDC.balanceOf(address(VAULT));
         if (currentBalance <= lastCheckpointBalance) return 0;
         return currentBalance - lastCheckpointBalance;
     }
 
-    /// @notice Returns the number of unique addresses that have received rewards.
     function rewardRecipientCount() external view returns (uint256) {
         return _rewardRecipients.length;
     }
 
-    /// @notice Returns all addresses that have ever received rewards and their
-    ///         cumulative totals.
     function allRewardRecipients()
         external
         view
@@ -371,9 +372,6 @@ contract GameRewardsDistributor is Auth {
         }
     }
 
-    /// @notice Returns a paginated slice of reward recipients.
-    /// @param offset Start index.
-    /// @param limit  Max entries to return.
     function rewardRecipientsPaginated(uint256 offset, uint256 limit)
         external
         view
@@ -395,9 +393,76 @@ contract GameRewardsDistributor is Auth {
         }
     }
 
-    // ========================= INTERNAL =========================
+    // ========================= INTERNAL: MANAGER CALLS =========================
 
-    /// @dev Records a reward for an address. Adds to the recipient set if new.
+    /// @dev Copies a storage proof array to memory.
+    function _loadProof(bytes32[] storage proof) internal view returns (bytes32[] memory) {
+        uint256 len = proof.length;
+        bytes32[] memory result = new bytes32[](len);
+        for (uint256 i; i < len; ++i) {
+            result[i] = proof[i];
+        }
+        return result;
+    }
+
+    /// @dev Via Manager: withdraw from Aave + transfer USDC from vault to this contract.
+    ///      2 batched calls in one manageVaultWithMerkleVerification.
+    function _managerWithdrawAndTransferToSelf(uint256 amount) internal {
+        bytes32[][] memory proofs = new bytes32[][](2);
+        proofs[0] = _loadProof(_withdrawProof);
+        proofs[1] = _loadProof(_transferProof);
+
+        address[] memory decoders = new address[](2);
+        decoders[0] = DECODER;
+        decoders[1] = DECODER;
+
+        address[] memory targets = new address[](2);
+        targets[0] = AAVE_POOL;
+        targets[1] = address(USDC);
+
+        bytes[] memory data = new bytes[](2);
+        data[0] = abi.encodeWithSignature(
+            "withdraw(address,uint256,address)", address(USDC), amount, address(VAULT)
+        );
+        data[1] = abi.encodeWithSignature(
+            "transfer(address,uint256)", address(this), amount
+        );
+
+        uint256[] memory values = new uint256[](2);
+
+        MANAGER.manageVaultWithMerkleVerification(proofs, decoders, targets, data, values);
+    }
+
+    /// @dev Via Manager: approve Aave pool + supply USDC from vault to Aave.
+    ///      2 batched calls in one manageVaultWithMerkleVerification.
+    function _managerApproveAndSupply(uint256 amount) internal {
+        bytes32[][] memory proofs = new bytes32[][](2);
+        proofs[0] = _loadProof(_approveProof);
+        proofs[1] = _loadProof(_supplyProof);
+
+        address[] memory decoders = new address[](2);
+        decoders[0] = DECODER;
+        decoders[1] = DECODER;
+
+        address[] memory targets = new address[](2);
+        targets[0] = address(USDC);
+        targets[1] = AAVE_POOL;
+
+        bytes[] memory data = new bytes[](2);
+        data[0] = abi.encodeWithSignature(
+            "approve(address,uint256)", AAVE_POOL, amount
+        );
+        data[1] = abi.encodeWithSignature(
+            "supply(address,uint256,address,uint16)", address(USDC), amount, address(VAULT), uint16(0)
+        );
+
+        uint256[] memory values = new uint256[](2);
+
+        MANAGER.manageVaultWithMerkleVerification(proofs, decoders, targets, data, values);
+    }
+
+    // ========================= INTERNAL: REWARD TRACKING =========================
+
     function _recordReward(address recipient, uint256 amount) internal {
         if (amount == 0) return;
         cumulativeRewards[recipient] += amount;

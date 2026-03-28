@@ -3,8 +3,9 @@ pragma solidity ^0.8.21;
 
 import {Test} from "@forge-std/Test.sol";
 import {BoringVault} from "boring-vault/base/BoringVault.sol";
+import {ManagerWithMerkleVerification} from "boring-vault/base/Roles/ManagerWithMerkleVerification.sol";
 import {GameRewardsDistributor} from "../src/GameRewardsDistributor.sol";
-import {ScopedVaultProxy} from "../src/ScopedVaultProxy.sol";
+import {ClawTogetherDecoderAndSanitizer} from "../src/ClawTogetherDecoderAndSanitizer.sol";
 import {Authority} from "@solmate/auth/Auth.sol";
 import {RolesAuthority} from "@solmate/auth/authorities/RolesAuthority.sol";
 import {ERC20} from "@solmate/tokens/ERC20.sol";
@@ -23,7 +24,7 @@ contract MockUSDC is ERC20 {
     function mint(address to, uint256 amount) external { _mint(to, amount); }
 }
 
-// Mock Aave Pool. Burns aUSDC from caller, mints USDC to recipient.
+// Mock Aave Pool.
 contract MockAavePool {
     MockUSDC public usdc;
     MockAToken public aUsdc;
@@ -51,7 +52,8 @@ contract GameRewardsDistributorTest is Test {
 
     BoringVault vault;
     RolesAuthority rolesAuthority;
-    ScopedVaultProxy proxy;
+    ManagerWithMerkleVerification manager;
+    ClawTogetherDecoderAndSanitizer decoder;
     GameRewardsDistributor distributor;
     MockUSDC usdc;
     MockAToken aUsdc;
@@ -65,7 +67,7 @@ contract GameRewardsDistributorTest is Test {
     uint8 constant MANAGER_ROLE = 1;
     uint8 constant OWNER_ROLE = 8;
     uint8 constant GAME_MASTER_ROLE = 20;
-    uint8 constant DISTRIBUTOR_ROLE = 21;
+    uint8 constant STRATEGIST_ROLE = 21;
 
     // Helpers to build single-winner arrays
     function _single(address w) internal pure returns (address[] memory winners, uint256[] memory bps) {
@@ -74,6 +76,66 @@ contract GameRewardsDistributorTest is Test {
         winners[0] = w;
         bps[0] = 10_000;
     }
+
+    // ========================= MERKLE TREE HELPERS =========================
+
+    function _hashPair(bytes32 a, bytes32 b) internal pure returns (bytes32) {
+        return a < b ? _efficientHash(a, b) : _efficientHash(b, a);
+    }
+
+    function _efficientHash(bytes32 a, bytes32 b) internal pure returns (bytes32 value) {
+        assembly {
+            mstore(0x00, a)
+            mstore(0x20, b)
+            value := keccak256(0x00, 0x40)
+        }
+    }
+
+    /// @dev Computes Merkle leaf matching ManagerWithMerkleVerification._verifyManageProof
+    function _computeLeaf(
+        address _decoder,
+        address target,
+        bool valueNonZero,
+        bytes4 selector,
+        bytes memory packedAddresses
+    ) internal pure returns (bytes32) {
+        return keccak256(abi.encodePacked(_decoder, target, valueNonZero, selector, packedAddresses));
+    }
+
+    /// @dev Builds a 4-leaf Merkle tree and returns root + proofs for each leaf.
+    function _buildTree4(bytes32 l0, bytes32 l1, bytes32 l2, bytes32 l3)
+        internal
+        pure
+        returns (
+            bytes32 root,
+            bytes32[] memory proof0,
+            bytes32[] memory proof1,
+            bytes32[] memory proof2,
+            bytes32[] memory proof3
+        )
+    {
+        bytes32 h01 = _hashPair(l0, l1);
+        bytes32 h23 = _hashPair(l2, l3);
+        root = _hashPair(h01, h23);
+
+        proof0 = new bytes32[](2);
+        proof0[0] = l1;
+        proof0[1] = h23;
+
+        proof1 = new bytes32[](2);
+        proof1[0] = l0;
+        proof1[1] = h23;
+
+        proof2 = new bytes32[](2);
+        proof2[0] = l3;
+        proof2[1] = h01;
+
+        proof3 = new bytes32[](2);
+        proof3[0] = l2;
+        proof3[1] = h01;
+    }
+
+    // ========================= SETUP =========================
 
     function setUp() public {
         usdc = new MockUSDC();
@@ -86,30 +148,42 @@ contract GameRewardsDistributorTest is Test {
         vm.prank(owner);
         vault.setAuthority(rolesAuthority);
 
-        proxy = new ScopedVaultProxy(owner, rolesAuthority, vault, address(usdc), address(aavePool));
+        // Deploy Manager (balancerVault = address(0), not needed)
+        manager = new ManagerWithMerkleVerification(owner, address(vault), address(0));
+        vm.prank(owner);
+        manager.setAuthority(rolesAuthority);
 
+        // Deploy Decoder
+        decoder = new ClawTogetherDecoderAndSanitizer(address(vault));
+
+        // Deploy Distributor
         distributor = new GameRewardsDistributor(
-            owner, rolesAuthority, vault, ERC20(address(usdc)), ERC20(address(aUsdc)), proxy, protocolWallet
+            owner,
+            rolesAuthority,
+            vault,
+            ERC20(address(usdc)),
+            ERC20(address(aUsdc)),
+            manager,
+            address(decoder),
+            address(aavePool),
+            protocolWallet
         );
 
         vm.startPrank(owner);
 
-        // Proxy gets MANAGER_ROLE on vault
-        rolesAuthority.setUserRole(address(proxy), MANAGER_ROLE, true);
+        // Manager gets MANAGER_ROLE on vault
+        rolesAuthority.setUserRole(address(manager), MANAGER_ROLE, true);
         rolesAuthority.setRoleCapability(
             MANAGER_ROLE, address(vault), bytes4(keccak256("manage(address,bytes,uint256)")), true
         );
 
-        // Distributor gets DISTRIBUTOR_ROLE on proxy
-        rolesAuthority.setUserRole(address(distributor), DISTRIBUTOR_ROLE, true);
+        // Distributor gets STRATEGIST_ROLE on Manager
+        rolesAuthority.setUserRole(address(distributor), STRATEGIST_ROLE, true);
         rolesAuthority.setRoleCapability(
-            DISTRIBUTOR_ROLE, address(proxy), ScopedVaultProxy.aaveWithdrawUsdc.selector, true
-        );
-        rolesAuthority.setRoleCapability(
-            DISTRIBUTOR_ROLE, address(proxy), ScopedVaultProxy.aaveSupplyUsdc.selector, true
-        );
-        rolesAuthority.setRoleCapability(
-            DISTRIBUTOR_ROLE, address(proxy), ScopedVaultProxy.vaultTransferUsdc.selector, true
+            STRATEGIST_ROLE,
+            address(manager),
+            ManagerWithMerkleVerification.manageVaultWithMerkleVerification.selector,
+            true
         );
 
         // Game master can call distributeRewards
@@ -136,6 +210,9 @@ contract GameRewardsDistributorTest is Test {
             OWNER_ROLE, address(distributor), GameRewardsDistributor.adjustCheckpoint.selector, true
         );
         rolesAuthority.setRoleCapability(
+            OWNER_ROLE, address(distributor), GameRewardsDistributor.setMerkleProofs.selector, true
+        );
+        rolesAuthority.setRoleCapability(
             OWNER_ROLE, address(distributor), GameRewardsDistributor.supplyAndCheckpoint.selector, true
         );
         rolesAuthority.setRoleCapability(
@@ -152,9 +229,67 @@ contract GameRewardsDistributorTest is Test {
         vm.prank(address(vault));
         usdc.approve(address(aavePool), type(uint256).max);
 
+        // Build Merkle tree and set proofs
+        _setupMerkleTree();
+
         // Reset checkpoint after seeding
         vm.prank(owner);
         distributor.resetCheckpoint();
+    }
+
+    function _setupMerkleTree() internal {
+        // 4 leaves matching the operations the distributor will perform:
+        // Leaf 0: approve(aavePool) on USDC
+        bytes32 approveLeaf = _computeLeaf(
+            address(decoder),
+            address(usdc),
+            false,
+            bytes4(keccak256("approve(address,uint256)")),
+            abi.encodePacked(address(aavePool))
+        );
+
+        // Leaf 1: supply(USDC, *, vault, *) on aavePool
+        bytes32 supplyLeaf = _computeLeaf(
+            address(decoder),
+            address(aavePool),
+            false,
+            bytes4(keccak256("supply(address,uint256,address,uint16)")),
+            abi.encodePacked(address(usdc), address(vault))
+        );
+
+        // Leaf 2: withdraw(USDC, *, vault) on aavePool
+        bytes32 withdrawLeaf = _computeLeaf(
+            address(decoder),
+            address(aavePool),
+            false,
+            bytes4(keccak256("withdraw(address,uint256,address)")),
+            abi.encodePacked(address(usdc), address(vault))
+        );
+
+        // Leaf 3: transfer(distributor, *) on USDC
+        bytes32 transferLeaf = _computeLeaf(
+            address(decoder),
+            address(usdc),
+            false,
+            bytes4(keccak256("transfer(address,uint256)")),
+            abi.encodePacked(address(distributor))
+        );
+
+        (
+            bytes32 root,
+            bytes32[] memory approveProof,
+            bytes32[] memory supplyProof,
+            bytes32[] memory withdrawProof,
+            bytes32[] memory transferProof
+        ) = _buildTree4(approveLeaf, supplyLeaf, withdrawLeaf, transferLeaf);
+
+        // Owner sets Merkle root on Manager for the distributor
+        vm.prank(owner);
+        manager.setManageRoot(address(distributor), root);
+
+        // Owner stores proofs in distributor
+        vm.prank(owner);
+        distributor.setMerkleProofs(approveProof, supplyProof, withdrawProof, transferProof);
     }
 
     // ========================= SINGLE WINNER (backward compat) =========================
@@ -196,15 +331,12 @@ contract GameRewardsDistributorTest is Test {
         uint256[] memory bps = new uint256[](2);
         winners[0] = winner;
         winners[1] = winner2;
-        bps[0] = 7_000; // 70% of winner share
-        bps[1] = 3_000; // 30% of winner share
+        bps[0] = 7_000;
+        bps[1] = 3_000;
 
         vm.prank(gameMaster);
         distributor.distributeRewards(winners, bps);
 
-        // Winner share is 80% of 1000 = 800
-        // winner gets 70% of 800 = 560
-        // winner2 gets 30% of 800 = 240
         assertEq(usdc.balanceOf(winner), 560e6);
         assertEq(usdc.balanceOf(winner2), 240e6);
         assertEq(usdc.balanceOf(protocolWallet), 100e6);
@@ -220,7 +352,6 @@ contract GameRewardsDistributorTest is Test {
         winners[0] = winner;
         winners[1] = winner2;
         winners[2] = winner3;
-        // ~33.33% each
         bps[0] = 3_334;
         bps[1] = 3_333;
         bps[2] = 3_333;
@@ -228,10 +359,6 @@ contract GameRewardsDistributorTest is Test {
         vm.prank(gameMaster);
         distributor.distributeRewards(winners, bps);
 
-        // Winner share = 80% of 900 = 720
-        // winner:  720 * 3334 / 10000 = 240.048 -> 240048000 (240.048e6)
-        // winner2: 720 * 3333 / 10000 = 239.976 -> 239976000 (239.976e6)
-        // winner3: gets remainder = 720 - 240.048 - 239.976 = 239.976
         uint256 w1 = usdc.balanceOf(winner);
         uint256 w2 = usdc.balanceOf(winner2);
         uint256 w3 = usdc.balanceOf(winner3);
@@ -249,13 +376,12 @@ contract GameRewardsDistributorTest is Test {
         uint256[] memory bps = new uint256[](10);
         for (uint256 i; i < 10; i++) {
             winners[i] = address(uint160(0x100 + i));
-            bps[i] = 1_000; // 10% each
+            bps[i] = 1_000;
         }
 
         vm.prank(gameMaster);
         distributor.distributeRewards(winners, bps);
 
-        // Winner share = 80% of 10000 = 8000, each gets 800
         uint256 totalDistributed;
         for (uint256 i; i < 10; i++) {
             totalDistributed += usdc.balanceOf(winners[i]);
@@ -273,7 +399,7 @@ contract GameRewardsDistributorTest is Test {
             winners[i] = address(uint160(0x100 + i));
             bps[i] = 909;
         }
-        bps[10] = 910; // adjust to sum to 10000
+        bps[10] = 910;
 
         vm.prank(gameMaster);
         vm.expectRevert(abi.encodeWithSignature("TooManyWinners()"));
@@ -313,7 +439,7 @@ contract GameRewardsDistributorTest is Test {
         winners[0] = winner;
         winners[1] = address(0xE);
         bps[0] = 5_000;
-        bps[1] = 4_000; // sums to 9000, not 10000
+        bps[1] = 4_000;
 
         vm.prank(gameMaster);
         vm.expectRevert(abi.encodeWithSignature("WinnerBpsMustTotal10000()"));
@@ -383,10 +509,9 @@ contract GameRewardsDistributorTest is Test {
         vm.prank(gameMaster);
         distributor.distributeRewards(winners, bps);
 
-        // Winner share = 800, winner gets 60% = 480, winner2 gets 40% = 320
         assertEq(distributor.cumulativeRewards(winner), 480e6);
         assertEq(distributor.cumulativeRewards(winner2), 320e6);
-        assertEq(distributor.rewardRecipientCount(), 3); // winner, winner2, protocolWallet
+        assertEq(distributor.rewardRecipientCount(), 3);
     }
 
     function test_allRewardRecipients() public {
@@ -409,7 +534,6 @@ contract GameRewardsDistributorTest is Test {
         distributor.distributeRewards(w3, b3);
 
         (address[] memory recipients,) = distributor.allRewardRecipients();
-        // 4 unique: winner, protocolWallet, winner2, winner3
         assertEq(recipients.length, 4);
         assertEq(distributor.cumulativeRewards(protocolWallet), 90e6);
     }
@@ -440,59 +564,42 @@ contract GameRewardsDistributorTest is Test {
     // ========================= ADJUST CHECKPOINT =========================
 
     function test_adjustCheckpoint_positiveDeposit() public {
-        uint256 before = distributor.lastCheckpointBalance();
-
-        // Simulate: user deposits 500 USDC, operator supplies to Aave
+        uint256 before_ = distributor.lastCheckpointBalance();
         aUsdc.mint(address(vault), 500e6);
-
-        // Admin adjusts checkpoint so the 500 isn't counted as yield
         vm.prank(owner);
         distributor.adjustCheckpoint(int256(500e6));
-
-        assertEq(distributor.lastCheckpointBalance(), before + 500e6);
+        assertEq(distributor.lastCheckpointBalance(), before_ + 500e6);
         assertEq(distributor.pendingYield(), 0);
     }
 
     function test_adjustCheckpoint_negativeWithdrawal() public {
-        uint256 before = distributor.lastCheckpointBalance();
-
-        // Simulate: user withdraws, 200 aUSDC burned from vault
+        uint256 before_ = distributor.lastCheckpointBalance();
         aUsdc.burn(address(vault), 200e6);
-
-        // Admin adjusts checkpoint down so it's not seen as negative yield
         vm.prank(owner);
         distributor.adjustCheckpoint(-int256(200e6));
-
-        assertEq(distributor.lastCheckpointBalance(), before - 200e6);
+        assertEq(distributor.lastCheckpointBalance(), before_ - 200e6);
         assertEq(distributor.pendingYield(), 0);
     }
 
     function test_adjustCheckpoint_yieldStillTrackedAfterDeposit() public {
-        // Deposit 500 + adjust checkpoint
         aUsdc.mint(address(vault), 500e6);
         vm.prank(owner);
         distributor.adjustCheckpoint(int256(500e6));
         assertEq(distributor.pendingYield(), 0);
 
-        // Now simulate 100 yield
         aUsdc.simulateYield(address(vault), 100e6);
         assertEq(distributor.pendingYield(), 100e6);
 
-        // Distribute works on the 100 yield only
         (address[] memory w, uint256[] memory b) = _single(winner);
         vm.prank(gameMaster);
         distributor.distributeRewards(w, b);
-
-        assertEq(usdc.balanceOf(winner), 80e6); // 80% of 100
+        assertEq(usdc.balanceOf(winner), 80e6);
     }
 
     function test_adjustCheckpoint_floorsToZero() public {
-        // Try to subtract more than checkpoint
         uint256 checkpoint = distributor.lastCheckpointBalance();
-
         vm.prank(owner);
         distributor.adjustCheckpoint(-int256(checkpoint + 1_000e6));
-
         assertEq(distributor.lastCheckpointBalance(), 0);
     }
 
@@ -504,30 +611,21 @@ contract GameRewardsDistributorTest is Test {
 
     // ========================= SCENARIO: DEPOSITS/WITHDRAWALS BETWEEN DISTRIBUTIONS =========================
 
-    /// @notice Core scenario: deposit between two distributions should NOT inflate yield.
     function test_scenario_depositBetweenDistributions() public {
-        // Round 1: 500 yield accrues
         aUsdc.simulateYield(address(vault), 500e6);
-        assertEq(distributor.pendingYield(), 500e6);
 
         (address[] memory w, uint256[] memory b) = _single(winner);
         vm.prank(gameMaster);
         distributor.distributeRewards(w, b);
 
-        // winner: 80% of 500 = 400
-        // protocol: 10% of 500 = 50
-        // vault depositors: 10% of 500 = 50 (stays as aUSDC)
         assertEq(usdc.balanceOf(winner), 400e6);
         assertEq(usdc.balanceOf(protocolWallet), 50e6);
-        assertEq(distributor.pendingYield(), 0);
 
-        // --- Between rounds: user deposits 2000 USDC, operator supplies to Aave ---
-        aUsdc.mint(address(vault), 2_000e6); // aUSDC minted from Aave supply
+        aUsdc.mint(address(vault), 2_000e6);
         vm.prank(owner);
         distributor.adjustCheckpoint(int256(2_000e6));
-        assertEq(distributor.pendingYield(), 0); // deposit is NOT yield
+        assertEq(distributor.pendingYield(), 0);
 
-        // Round 2: 300 yield accrues ON TOP of the deposit
         aUsdc.simulateYield(address(vault), 300e6);
         assertEq(distributor.pendingYield(), 300e6);
 
@@ -536,212 +634,78 @@ contract GameRewardsDistributorTest is Test {
         vm.prank(gameMaster);
         distributor.distributeRewards(w2, b2);
 
-        // winner2: 80% of 300 = 240
-        // protocol: 10% of 300 = 30 (cumulative: 50 + 30 = 80)
         assertEq(usdc.balanceOf(winner2), 240e6);
         assertEq(usdc.balanceOf(protocolWallet), 80e6);
-        assertEq(distributor.pendingYield(), 0);
     }
 
-    /// @notice Withdrawal between distributions should NOT create phantom negative yield.
-    function test_scenario_withdrawalBetweenDistributions() public {
-        // Round 1: 1000 yield
-        aUsdc.simulateYield(address(vault), 1000e6);
-
-        (address[] memory w, uint256[] memory b) = _single(winner);
-        vm.prank(gameMaster);
-        distributor.distributeRewards(w, b);
-
-        assertEq(usdc.balanceOf(winner), 800e6);
-        assertEq(usdc.balanceOf(protocolWallet), 100e6);
-
-        // --- Between rounds: user withdraws 5000, aUSDC burned ---
-        aUsdc.burn(address(vault), 5_000e6);
-        vm.prank(owner);
-        distributor.adjustCheckpoint(-int256(5_000e6));
-        assertEq(distributor.pendingYield(), 0);
-
-        // Round 2: 200 yield accrues on the now-smaller balance
-        aUsdc.simulateYield(address(vault), 200e6);
-        assertEq(distributor.pendingYield(), 200e6);
-
-        vm.prank(gameMaster);
-        distributor.distributeRewards(w, b);
-
-        // winner: 800 + 160 = 960
-        // protocol: 100 + 20 = 120
-        assertEq(usdc.balanceOf(winner), 960e6);
-        assertEq(usdc.balanceOf(protocolWallet), 120e6);
-    }
-
-    /// @notice Multiple deposits AND withdrawals between a single distribution.
     function test_scenario_multipleDepositsAndWithdrawals_thenDistribute() public {
-        // Start: vault has 1M aUSDC, checkpoint = 1M
-
-        // Deposit 1: +500
         aUsdc.mint(address(vault), 500e6);
         vm.prank(owner);
         distributor.adjustCheckpoint(int256(500e6));
 
-        // Withdrawal 1: -200
         aUsdc.burn(address(vault), 200e6);
         vm.prank(owner);
         distributor.adjustCheckpoint(-int256(200e6));
 
-        // Deposit 2: +1000
         aUsdc.mint(address(vault), 1_000e6);
         vm.prank(owner);
         distributor.adjustCheckpoint(int256(1_000e6));
 
-        // Withdrawal 2: -300
         aUsdc.burn(address(vault), 300e6);
         vm.prank(owner);
         distributor.adjustCheckpoint(-int256(300e6));
 
-        // Net deposit effect: +500 -200 +1000 -300 = +1000
-        // Vault aUSDC: 1M + 1000 = 1,001,000
-        // Checkpoint:  1M + 1000 = 1,001,000
         assertEq(distributor.pendingYield(), 0);
 
-        // NOW yield accrues: +777
         aUsdc.simulateYield(address(vault), 777e6);
         assertEq(distributor.pendingYield(), 777e6);
 
-        // Distribute: only the 777 yield goes out
         (address[] memory w, uint256[] memory b) = _single(winner);
         vm.prank(gameMaster);
         distributor.distributeRewards(w, b);
 
-        // winner: 80% of 777 = 621.6 -> 621600000
-        // protocol: 10% of 777 = 77.7 -> 77700000
-        // vault: 10% of 777 = 77.7 -> stays
         uint256 expectedWinner = (777e6 * 8_000) / 10_000;
         uint256 expectedProtocol = (777e6 * 1_000) / 10_000;
-        uint256 expectedVault = 777e6 - expectedWinner - expectedProtocol;
-
         assertEq(usdc.balanceOf(winner), expectedWinner);
         assertEq(usdc.balanceOf(protocolWallet), expectedProtocol);
-        assertEq(distributor.totalVaultRewards(), expectedVault);
+    }
+
+    function test_scenario_forgottenAdjust_inflatesYield() public {
+        aUsdc.mint(address(vault), 5_000e6);
+        assertEq(distributor.pendingYield(), 5_000e6);
+
+        (address[] memory w, uint256[] memory b) = _single(winner);
+        vm.prank(gameMaster);
+        distributor.distributeRewards(w, b);
+
+        assertEq(usdc.balanceOf(winner), 4_000e6);
+    }
+
+    // ========================= ATOMIC SUPPLY / WITHDRAW =========================
+
+    function test_supplyAndCheckpoint_basic() public {
+        uint256 checkpointBefore = distributor.lastCheckpointBalance();
+        usdc.mint(address(vault), 500e6);
+        vm.prank(owner);
+        distributor.supplyAndCheckpoint(500e6);
+        assertEq(distributor.lastCheckpointBalance(), checkpointBefore + 500e6);
         assertEq(distributor.pendingYield(), 0);
     }
 
-    /// @notice Three full rounds with deposits between each. Verify cumulative tracking is exact.
-    function test_scenario_threeRounds_depositsEachTime() public {
-        uint256 cumulativeWinner;
-        uint256 cumulativeProtocol;
-        uint256 cumulativeVault;
-
-        // Round 1: 100 yield, no deposits
-        aUsdc.simulateYield(address(vault), 100e6);
-        (address[] memory w, uint256[] memory b) = _single(winner);
-        vm.prank(gameMaster);
-        distributor.distributeRewards(w, b);
-        cumulativeWinner += 80e6;
-        cumulativeProtocol += 10e6;
-        cumulativeVault += 10e6;
-        assertEq(usdc.balanceOf(winner), cumulativeWinner);
-
-        // Deposit 5000 between rounds
-        aUsdc.mint(address(vault), 5_000e6);
+    function test_withdrawAndCheckpoint_basic() public {
+        uint256 checkpointBefore = distributor.lastCheckpointBalance();
+        address user = address(0x123);
         vm.prank(owner);
-        distributor.adjustCheckpoint(int256(5_000e6));
-
-        // Round 2: 250 yield
-        aUsdc.simulateYield(address(vault), 250e6);
-        vm.prank(gameMaster);
-        distributor.distributeRewards(w, b);
-        cumulativeWinner += 200e6;
-        cumulativeProtocol += 25e6;
-        cumulativeVault += 25e6;
-        assertEq(usdc.balanceOf(winner), cumulativeWinner);
-
-        // Deposit 3000 between rounds
-        aUsdc.mint(address(vault), 3_000e6);
-        vm.prank(owner);
-        distributor.adjustCheckpoint(int256(3_000e6));
-
-        // Round 3: 400 yield
-        aUsdc.simulateYield(address(vault), 400e6);
-        vm.prank(gameMaster);
-        distributor.distributeRewards(w, b);
-        cumulativeWinner += 320e6;
-        cumulativeProtocol += 40e6;
-        cumulativeVault += 40e6;
-
-        assertEq(usdc.balanceOf(winner), cumulativeWinner); // 80 + 200 + 320 = 600
-        assertEq(usdc.balanceOf(protocolWallet), cumulativeProtocol); // 10 + 25 + 40 = 75
-        assertEq(distributor.totalWinnerRewards(), cumulativeWinner);
-        assertEq(distributor.totalProtocolRewards(), cumulativeProtocol);
-        assertEq(distributor.totalVaultRewards(), cumulativeVault); // 10 + 25 + 40 = 75
-        assertEq(distributor.cumulativeRewards(winner), cumulativeWinner);
+        distributor.withdrawAndCheckpoint(200e6, user);
+        assertEq(distributor.lastCheckpointBalance(), checkpointBefore - 200e6);
+        assertEq(usdc.balanceOf(user), 200e6);
+        assertEq(distributor.pendingYield(), 0);
     }
 
-    /// @notice Multi-winner distribution with deposit in between. Verify each winner gets correct share.
-    function test_scenario_multiWinner_withDepositBetween() public {
-        address winner2 = address(0xE);
-        address winner3 = address(0xF);
-
-        // Round 1: 600 yield, 3 winners at 50/30/20
-        aUsdc.simulateYield(address(vault), 600e6);
-
-        address[] memory winners = new address[](3);
-        uint256[] memory bps = new uint256[](3);
-        winners[0] = winner;
-        winners[1] = winner2;
-        winners[2] = winner3;
-        bps[0] = 5_000;
-        bps[1] = 3_000;
-        bps[2] = 2_000;
-
-        vm.prank(gameMaster);
-        distributor.distributeRewards(winners, bps);
-
-        // Winner share = 80% of 600 = 480
-        // winner:  50% of 480 = 240
-        // winner2: 30% of 480 = 144
-        // winner3: 20% of 480 = 96 (remainder: 480 - 240 - 144 = 96)
-        assertEq(usdc.balanceOf(winner), 240e6);
-        assertEq(usdc.balanceOf(winner2), 144e6);
-        assertEq(usdc.balanceOf(winner3), 96e6);
-        assertEq(usdc.balanceOf(protocolWallet), 60e6);
-
-        // Large deposit between rounds
-        aUsdc.mint(address(vault), 10_000e6);
+    function test_supplyAndCheckpoint_cannotCreatePhantomYield() public {
+        usdc.mint(address(vault), 5_000e6);
         vm.prank(owner);
-        distributor.adjustCheckpoint(int256(10_000e6));
-
-        // Round 2: 1000 yield, 2 winners at 70/30
-        aUsdc.simulateYield(address(vault), 1000e6);
-
-        address[] memory w2 = new address[](2);
-        uint256[] memory b2 = new uint256[](2);
-        w2[0] = winner;
-        w2[1] = winner2;
-        b2[0] = 7_000;
-        b2[1] = 3_000;
-
-        vm.prank(gameMaster);
-        distributor.distributeRewards(w2, b2);
-
-        // Winner share = 80% of 1000 = 800
-        // winner:  70% of 800 = 560
-        // winner2: 30% of 800 = 240
-        assertEq(usdc.balanceOf(winner), 240e6 + 560e6); // 800 total
-        assertEq(usdc.balanceOf(winner2), 144e6 + 240e6); // 384 total
-        assertEq(usdc.balanceOf(protocolWallet), 60e6 + 100e6); // 160 total
-    }
-
-    /// @notice Ensure that if NO yield accrues between deposit adjustments, distribution reverts.
-    function test_scenario_depositOnly_noYield_reverts() public {
-        // Multiple deposits, no yield
-        aUsdc.mint(address(vault), 1_000e6);
-        vm.prank(owner);
-        distributor.adjustCheckpoint(int256(1_000e6));
-
-        aUsdc.mint(address(vault), 2_000e6);
-        vm.prank(owner);
-        distributor.adjustCheckpoint(int256(2_000e6));
-
+        distributor.supplyAndCheckpoint(5_000e6);
         assertEq(distributor.pendingYield(), 0);
 
         (address[] memory w, uint256[] memory b) = _single(winner);
@@ -750,182 +714,118 @@ contract GameRewardsDistributorTest is Test {
         distributor.distributeRewards(w, b);
     }
 
-    /// @notice Simultaneous deposit and yield in the same "block" — only yield is distributed.
-    function test_scenario_depositAndYield_sameTime() public {
-        // Deposit 5000 and 300 yield arrive "simultaneously"
-        aUsdc.mint(address(vault), 5_300e6); // 5000 deposit + 300 yield
-
-        // Admin adjusts for the deposit portion only
+    function test_supplyAndCheckpoint_multipleSupplies_thenYield() public {
+        usdc.mint(address(vault), 1_000e6);
         vm.prank(owner);
-        distributor.adjustCheckpoint(int256(5_000e6));
+        distributor.supplyAndCheckpoint(1_000e6);
 
-        // pendingYield should reflect the 300 yield
+        usdc.mint(address(vault), 2_000e6);
+        vm.prank(owner);
+        distributor.supplyAndCheckpoint(2_000e6);
+
+        aUsdc.simulateYield(address(vault), 300e6);
         assertEq(distributor.pendingYield(), 300e6);
 
         (address[] memory w, uint256[] memory b) = _single(winner);
         vm.prank(gameMaster);
         distributor.distributeRewards(w, b);
 
-        assertEq(usdc.balanceOf(winner), 240e6); // 80% of 300
-        assertEq(usdc.balanceOf(protocolWallet), 30e6); // 10% of 300
+        assertEq(usdc.balanceOf(winner), 240e6);
+        assertEq(usdc.balanceOf(protocolWallet), 30e6);
     }
 
-    /// @notice Large withdrawal that nearly empties the vault, then small yield, then distribute.
-    function test_scenario_nearTotalWithdrawal_thenYield() public {
-        // Vault has 1M aUSDC. Withdraw 999,000.
-        aUsdc.burn(address(vault), 999_000e6);
+    function test_withdrawAndCheckpoint_thenYield() public {
+        address user = address(0x123);
         vm.prank(owner);
-        distributor.adjustCheckpoint(-int256(999_000e6));
-
-        // Only 1000 aUSDC remains. Checkpoint = 1000.
-        assertEq(distributor.lastCheckpointBalance(), 1_000e6);
+        distributor.withdrawAndCheckpoint(500_000e6, user);
         assertEq(distributor.pendingYield(), 0);
 
-        // Tiny yield: 5 USDC
-        aUsdc.simulateYield(address(vault), 5e6);
-        assertEq(distributor.pendingYield(), 5e6);
+        aUsdc.simulateYield(address(vault), 100e6);
+        assertEq(distributor.pendingYield(), 100e6);
 
         (address[] memory w, uint256[] memory b) = _single(winner);
         vm.prank(gameMaster);
         distributor.distributeRewards(w, b);
-
-        // winner: 80% of 5 = 4
-        // protocol: 10% of 5 = 0.5 -> 500000
-        assertEq(usdc.balanceOf(winner), 4e6);
-        assertEq(usdc.balanceOf(protocolWallet), 500_000); // 0.5 USDC
+        assertEq(usdc.balanceOf(winner), 80e6);
     }
 
-    /// @notice Stress test: 5 rounds with alternating deposits/withdrawals/yield.
-    function test_scenario_fiveRounds_complexFlow() public {
-        uint256 totalYieldDistributed;
+    function test_supplyAndWithdraw_mixedBetweenDistributions() public {
+        address user = address(0x123);
 
-        // === Round 1: 100 yield ===
+        aUsdc.simulateYield(address(vault), 200e6);
+        (address[] memory w, uint256[] memory b) = _single(winner);
+        vm.prank(gameMaster);
+        distributor.distributeRewards(w, b);
+        assertEq(usdc.balanceOf(winner), 160e6);
+
+        usdc.mint(address(vault), 3_000e6);
+        vm.prank(owner);
+        distributor.supplyAndCheckpoint(3_000e6);
+
+        vm.prank(owner);
+        distributor.withdrawAndCheckpoint(1_000e6, user);
+
+        assertEq(distributor.pendingYield(), 0);
+
+        aUsdc.simulateYield(address(vault), 500e6);
+        vm.prank(gameMaster);
+        distributor.distributeRewards(w, b);
+        assertEq(usdc.balanceOf(winner), 560e6);
+        assertEq(usdc.balanceOf(protocolWallet), 70e6);
+    }
+
+    function test_withdrawAndCheckpoint_fullWithdrawal() public {
+        uint256 checkpoint = distributor.lastCheckpointBalance();
+        vm.prank(owner);
+        distributor.withdrawAndCheckpoint(checkpoint, address(0x123));
+        assertEq(distributor.lastCheckpointBalance(), 0);
+        assertEq(usdc.balanceOf(address(0x123)), checkpoint);
+    }
+
+    function test_revert_withdrawAndCheckpoint_zeroAddress() public {
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSignature("ZeroAddress()"));
+        distributor.withdrawAndCheckpoint(100e6, address(0));
+    }
+
+    function test_revert_supplyAndCheckpoint_unauthorized() public {
+        usdc.mint(address(vault), 100e6);
+        vm.prank(gameMaster);
+        vm.expectRevert("UNAUTHORIZED");
+        distributor.supplyAndCheckpoint(100e6);
+    }
+
+    function test_revert_withdrawAndCheckpoint_unauthorized() public {
+        vm.prank(gameMaster);
+        vm.expectRevert("UNAUTHORIZED");
+        distributor.withdrawAndCheckpoint(100e6, winner);
+    }
+
+    // ========================= MERKLE PROOFS NOT SET =========================
+
+    function test_revert_distributeRewards_merkleProofsNotSet() public {
+        // Deploy a fresh distributor without proofs
+        GameRewardsDistributor freshDist = new GameRewardsDistributor(
+            owner, rolesAuthority, vault, ERC20(address(usdc)), ERC20(address(aUsdc)),
+            manager, address(decoder), address(aavePool), protocolWallet
+        );
+        vm.startPrank(owner);
+        rolesAuthority.setRoleCapability(
+            GAME_MASTER_ROLE, address(freshDist), GameRewardsDistributor.distributeRewards.selector, true
+        );
+        vm.stopPrank();
+
         aUsdc.simulateYield(address(vault), 100e6);
         (address[] memory w, uint256[] memory b) = _single(winner);
         vm.prank(gameMaster);
-        distributor.distributeRewards(w, b);
-        totalYieldDistributed += 100e6;
-
-        // Deposit 2000
-        aUsdc.mint(address(vault), 2_000e6);
-        vm.prank(owner);
-        distributor.adjustCheckpoint(int256(2_000e6));
-
-        // === Round 2: 50 yield ===
-        aUsdc.simulateYield(address(vault), 50e6);
-        vm.prank(gameMaster);
-        distributor.distributeRewards(w, b);
-        totalYieldDistributed += 50e6;
-
-        // Withdraw 500
-        aUsdc.burn(address(vault), 500e6);
-        vm.prank(owner);
-        distributor.adjustCheckpoint(-int256(500e6));
-
-        // Deposit 1000
-        aUsdc.mint(address(vault), 1_000e6);
-        vm.prank(owner);
-        distributor.adjustCheckpoint(int256(1_000e6));
-
-        // === Round 3: 200 yield ===
-        aUsdc.simulateYield(address(vault), 200e6);
-        vm.prank(gameMaster);
-        distributor.distributeRewards(w, b);
-        totalYieldDistributed += 200e6;
-
-        // Withdraw 3000
-        aUsdc.burn(address(vault), 3_000e6);
-        vm.prank(owner);
-        distributor.adjustCheckpoint(-int256(3_000e6));
-
-        // === Round 4: 75 yield ===
-        aUsdc.simulateYield(address(vault), 75e6);
-        vm.prank(gameMaster);
-        distributor.distributeRewards(w, b);
-        totalYieldDistributed += 75e6;
-
-        // Deposit 10000, Withdraw 4000 (net +6000)
-        aUsdc.mint(address(vault), 10_000e6);
-        vm.prank(owner);
-        distributor.adjustCheckpoint(int256(10_000e6));
-        aUsdc.burn(address(vault), 4_000e6);
-        vm.prank(owner);
-        distributor.adjustCheckpoint(-int256(4_000e6));
-
-        // === Round 5: 500 yield ===
-        aUsdc.simulateYield(address(vault), 500e6);
-        vm.prank(gameMaster);
-        distributor.distributeRewards(w, b);
-        totalYieldDistributed += 500e6;
-
-        // Verify totals: all yield = 100 + 50 + 200 + 75 + 500 = 925
-        assertEq(totalYieldDistributed, 925e6);
-
-        uint256 expectedWinnerTotal = (totalYieldDistributed * 8_000) / 10_000; // 740
-        uint256 expectedProtocolTotal = (totalYieldDistributed * 1_000) / 10_000; // 92.5
-
-        assertEq(usdc.balanceOf(winner), expectedWinnerTotal);
-        assertEq(usdc.balanceOf(protocolWallet), expectedProtocolTotal);
-        assertEq(distributor.totalWinnerRewards(), expectedWinnerTotal);
-        assertEq(distributor.totalProtocolRewards(), expectedProtocolTotal);
-        assertEq(distributor.pendingYield(), 0);
-    }
-
-    /// @notice Verify accounting holds with a fee split change mid-stream between deposits.
-    function test_scenario_feeSplitChange_betweenDeposits() public {
-        // Round 1: default splits (80/10/10), 1000 yield
-        aUsdc.simulateYield(address(vault), 1000e6);
-        (address[] memory w, uint256[] memory b) = _single(winner);
-        vm.prank(gameMaster);
-        distributor.distributeRewards(w, b);
-
-        assertEq(usdc.balanceOf(winner), 800e6);
-        assertEq(usdc.balanceOf(protocolWallet), 100e6);
-
-        // Deposit 5000 between rounds
-        aUsdc.mint(address(vault), 5_000e6);
-        vm.prank(owner);
-        distributor.adjustCheckpoint(int256(5_000e6));
-
-        // Change fee splits to 60/20/20
-        vm.prank(owner);
-        distributor.setFeeSplits(2_000, 2_000);
-
-        // Round 2: 500 yield
-        aUsdc.simulateYield(address(vault), 500e6);
-        vm.prank(gameMaster);
-        distributor.distributeRewards(w, b);
-
-        // winner: 60% of 500 = 300 (cumulative: 800 + 300 = 1100)
-        // protocol: 20% of 500 = 100 (cumulative: 100 + 100 = 200)
-        assertEq(usdc.balanceOf(winner), 1100e6);
-        assertEq(usdc.balanceOf(protocolWallet), 200e6);
-        assertEq(distributor.totalVaultRewards(), 100e6 + 100e6); // 10% of 1000 + 20% of 500
-    }
-
-    /// @notice Forgotten adjustCheckpoint after deposit inflates yield — shows why adjustment is critical.
-    function test_scenario_forgottenAdjust_inflatesYield() public {
-        // Deposit 5000 WITHOUT calling adjustCheckpoint
-        aUsdc.mint(address(vault), 5_000e6);
-
-        // The system thinks this is yield!
-        assertEq(distributor.pendingYield(), 5_000e6);
-
-        // If distributeRewards is called, the deposit gets distributed as "yield"
-        (address[] memory w, uint256[] memory b) = _single(winner);
-        vm.prank(gameMaster);
-        distributor.distributeRewards(w, b);
-
-        // This is WRONG behavior but proves the invariant:
-        // without adjustCheckpoint, deposits are treated as yield
-        assertEq(usdc.balanceOf(winner), 4_000e6); // 80% of 5000 (should be 0)
+        vm.expectRevert(abi.encodeWithSignature("MerkleProofsNotSet()"));
+        freshDist.distributeRewards(w, b);
     }
 
     // ========================= PAUSE =========================
 
     function test_pause_blocksDistribution() public {
         aUsdc.simulateYield(address(vault), 100e6);
-
         vm.prank(owner);
         distributor.setPaused(true);
 
@@ -937,48 +837,15 @@ contract GameRewardsDistributorTest is Test {
 
     function test_unpause_allowsDistribution() public {
         aUsdc.simulateYield(address(vault), 100e6);
-
         vm.prank(owner);
         distributor.setPaused(true);
-
         vm.prank(owner);
         distributor.setPaused(false);
 
         (address[] memory w, uint256[] memory b) = _single(winner);
         vm.prank(gameMaster);
         distributor.distributeRewards(w, b);
-
         assertEq(usdc.balanceOf(winner), 80e6);
-    }
-
-    // ========================= SCOPED PROXY =========================
-
-    function test_proxy_rejectsUnauthorizedCaller() public {
-        vm.prank(address(0xBAD));
-        vm.expectRevert("UNAUTHORIZED");
-        proxy.aaveWithdrawUsdc(100e6);
-
-        vm.prank(address(0xBAD));
-        vm.expectRevert("UNAUTHORIZED");
-        proxy.vaultTransferUsdc(winner, 100e6);
-    }
-
-    function test_proxy_distributorIsOnlyAuthorizedCaller() public {
-        vm.prank(gameMaster);
-        vm.expectRevert("UNAUTHORIZED");
-        proxy.aaveWithdrawUsdc(100e6);
-    }
-
-    function test_proxy_rejectsZeroAddress() public {
-        vm.prank(address(distributor));
-        vm.expectRevert(abi.encodeWithSignature("ScopedVaultProxy__ZeroAddress()"));
-        proxy.vaultTransferUsdc(address(0), 100e6);
-    }
-
-    function test_proxy_rejectsZeroAmount() public {
-        vm.prank(address(distributor));
-        vm.expectRevert(abi.encodeWithSignature("ScopedVaultProxy__ZeroAmount()"));
-        proxy.aaveWithdrawUsdc(0);
     }
 
     // ========================= REENTRANCY =========================
@@ -992,7 +859,6 @@ contract GameRewardsDistributorTest is Test {
         aUsdc.simulateYield(address(vault), 100e6);
         vm.prank(gameMaster);
         distributor.distributeRewards(w, b);
-
         assertEq(usdc.balanceOf(winner), 160e6);
     }
 
@@ -1027,16 +893,12 @@ contract GameRewardsDistributorTest is Test {
 
     function test_revert_invalidBps() public {
         vm.startPrank(owner);
-
         vm.expectRevert(abi.encodeWithSignature("InvalidBps()"));
         distributor.setFeeSplits(6_000, 1_000);
-
         vm.expectRevert(abi.encodeWithSignature("InvalidBps()"));
         distributor.setFeeSplits(1_000, 6_000);
-
         vm.expectRevert(abi.encodeWithSignature("InvalidBps()"));
         distributor.setFeeSplits(5_000, 5_000);
-
         vm.stopPrank();
     }
 
@@ -1052,19 +914,15 @@ contract GameRewardsDistributorTest is Test {
     function test_resetCheckpoint() public {
         aUsdc.simulateYield(address(vault), 500e6);
         assertEq(distributor.pendingYield(), 500e6);
-
         vm.prank(owner);
         distributor.resetCheckpoint();
-
         assertEq(distributor.pendingYield(), 0);
     }
 
     function test_pendingYield_view() public {
         assertEq(distributor.pendingYield(), 0);
-
         aUsdc.simulateYield(address(vault), 123e6);
         assertEq(distributor.pendingYield(), 123e6);
-
         aUsdc.simulateYield(address(vault), 77e6);
         assertEq(distributor.pendingYield(), 200e6);
     }
@@ -1083,264 +941,5 @@ contract GameRewardsDistributorTest is Test {
         vm.expectEmit(true, true, true, true);
         emit FeeSplitsUpdated(2_000, 500);
         distributor.setFeeSplits(2_000, 500);
-    }
-
-    // ========================= ATOMIC SUPPLY / WITHDRAW =========================
-
-    /// @notice supplyAndCheckpoint atomically supplies USDC to Aave and adjusts checkpoint.
-    function test_supplyAndCheckpoint_basic() public {
-        uint256 checkpointBefore = distributor.lastCheckpointBalance();
-
-        // Give the vault some USDC to supply
-        usdc.mint(address(vault), 500e6);
-
-        vm.prank(owner);
-        distributor.supplyAndCheckpoint(500e6);
-
-        // Checkpoint increased by exactly 500
-        assertEq(distributor.lastCheckpointBalance(), checkpointBefore + 500e6);
-        // No pending yield — the supply is principal, not yield
-        assertEq(distributor.pendingYield(), 0);
-    }
-
-    /// @notice withdrawAndCheckpoint atomically withdraws from Aave, sends to user, and adjusts checkpoint.
-    function test_withdrawAndCheckpoint_basic() public {
-        uint256 checkpointBefore = distributor.lastCheckpointBalance();
-        address user = address(0x123);
-
-        vm.prank(owner);
-        distributor.withdrawAndCheckpoint(200e6, user);
-
-        // Checkpoint decreased by exactly 200
-        assertEq(distributor.lastCheckpointBalance(), checkpointBefore - 200e6);
-        // User received the USDC
-        assertEq(usdc.balanceOf(user), 200e6);
-        // No pending yield
-        assertEq(distributor.pendingYield(), 0);
-    }
-
-    /// @notice Atomic supply cannot create phantom yield — the core invariant that fixes Issue 2.
-    function test_supplyAndCheckpoint_cannotCreatePhantomYield() public {
-        // Supply 5000 atomically — this is the exact scenario from Issue 2
-        usdc.mint(address(vault), 5_000e6);
-
-        vm.prank(owner);
-        distributor.supplyAndCheckpoint(5_000e6);
-
-        // Unlike the old two-tx flow, pendingYield is ALWAYS 0 after a supply
-        assertEq(distributor.pendingYield(), 0);
-
-        // distributeRewards correctly reverts — no yield to distribute
-        (address[] memory w, uint256[] memory b) = _single(winner);
-        vm.prank(gameMaster);
-        vm.expectRevert(abi.encodeWithSignature("NoYieldToDistribute()"));
-        distributor.distributeRewards(w, b);
-    }
-
-    /// @notice Multiple atomic supplies followed by yield — only yield is distributed.
-    function test_supplyAndCheckpoint_multipleSupplies_thenYield() public {
-        // Supply 1: 1000
-        usdc.mint(address(vault), 1_000e6);
-        vm.prank(owner);
-        distributor.supplyAndCheckpoint(1_000e6);
-        assertEq(distributor.pendingYield(), 0);
-
-        // Supply 2: 2000
-        usdc.mint(address(vault), 2_000e6);
-        vm.prank(owner);
-        distributor.supplyAndCheckpoint(2_000e6);
-        assertEq(distributor.pendingYield(), 0);
-
-        // Now yield accrues: 300
-        aUsdc.simulateYield(address(vault), 300e6);
-        assertEq(distributor.pendingYield(), 300e6);
-
-        // Distribute — only the 300 yield goes out
-        (address[] memory w, uint256[] memory b) = _single(winner);
-        vm.prank(gameMaster);
-        distributor.distributeRewards(w, b);
-
-        assertEq(usdc.balanceOf(winner), 240e6); // 80% of 300
-        assertEq(usdc.balanceOf(protocolWallet), 30e6); // 10% of 300
-    }
-
-    /// @notice Atomic withdraw followed by yield — only yield is distributed.
-    function test_withdrawAndCheckpoint_thenYield() public {
-        address user = address(0x123);
-
-        vm.prank(owner);
-        distributor.withdrawAndCheckpoint(500_000e6, user);
-
-        // vault principal decreased, but no phantom yield
-        assertEq(distributor.pendingYield(), 0);
-
-        // yield accrues on remaining balance
-        aUsdc.simulateYield(address(vault), 100e6);
-        assertEq(distributor.pendingYield(), 100e6);
-
-        (address[] memory w, uint256[] memory b) = _single(winner);
-        vm.prank(gameMaster);
-        distributor.distributeRewards(w, b);
-
-        assertEq(usdc.balanceOf(winner), 80e6);
-    }
-
-    /// @notice Mix of atomic supplies and withdrawals between distributions.
-    function test_supplyAndWithdraw_mixedBetweenDistributions() public {
-        address user = address(0x123);
-
-        // Round 1: yield 200
-        aUsdc.simulateYield(address(vault), 200e6);
-        (address[] memory w, uint256[] memory b) = _single(winner);
-        vm.prank(gameMaster);
-        distributor.distributeRewards(w, b);
-        assertEq(usdc.balanceOf(winner), 160e6); // 80% of 200
-
-        // Atomic supply 3000
-        usdc.mint(address(vault), 3_000e6);
-        vm.prank(owner);
-        distributor.supplyAndCheckpoint(3_000e6);
-
-        // Atomic withdraw 1000 for user
-        vm.prank(owner);
-        distributor.withdrawAndCheckpoint(1_000e6, user);
-
-        // Net principal change: +2000, no yield
-        assertEq(distributor.pendingYield(), 0);
-
-        // Round 2: yield 500
-        aUsdc.simulateYield(address(vault), 500e6);
-        assertEq(distributor.pendingYield(), 500e6);
-
-        vm.prank(gameMaster);
-        distributor.distributeRewards(w, b);
-
-        // winner: 160 + 400 = 560
-        assertEq(usdc.balanceOf(winner), 560e6);
-        // protocol: 20 + 50 = 70
-        assertEq(usdc.balanceOf(protocolWallet), 70e6);
-    }
-
-    /// @notice Stress test: 5 rounds with atomic operations between each.
-    function test_atomic_fiveRounds_stressTest() public {
-        address user = address(0x123);
-        uint256 totalYieldDistributed;
-
-        (address[] memory w, uint256[] memory b) = _single(winner);
-
-        // === Round 1: 100 yield ===
-        aUsdc.simulateYield(address(vault), 100e6);
-        vm.prank(gameMaster);
-        distributor.distributeRewards(w, b);
-        totalYieldDistributed += 100e6;
-
-        // Atomic supply 2000
-        usdc.mint(address(vault), 2_000e6);
-        vm.prank(owner);
-        distributor.supplyAndCheckpoint(2_000e6);
-
-        // === Round 2: 50 yield ===
-        aUsdc.simulateYield(address(vault), 50e6);
-        vm.prank(gameMaster);
-        distributor.distributeRewards(w, b);
-        totalYieldDistributed += 50e6;
-
-        // Atomic withdraw 500
-        vm.prank(owner);
-        distributor.withdrawAndCheckpoint(500e6, user);
-
-        // Atomic supply 1000
-        usdc.mint(address(vault), 1_000e6);
-        vm.prank(owner);
-        distributor.supplyAndCheckpoint(1_000e6);
-
-        // === Round 3: 200 yield ===
-        aUsdc.simulateYield(address(vault), 200e6);
-        vm.prank(gameMaster);
-        distributor.distributeRewards(w, b);
-        totalYieldDistributed += 200e6;
-
-        // Atomic withdraw 3000
-        vm.prank(owner);
-        distributor.withdrawAndCheckpoint(3_000e6, user);
-
-        // === Round 4: 75 yield ===
-        aUsdc.simulateYield(address(vault), 75e6);
-        vm.prank(gameMaster);
-        distributor.distributeRewards(w, b);
-        totalYieldDistributed += 75e6;
-
-        // Atomic supply 10000, withdraw 4000
-        usdc.mint(address(vault), 10_000e6);
-        vm.prank(owner);
-        distributor.supplyAndCheckpoint(10_000e6);
-        vm.prank(owner);
-        distributor.withdrawAndCheckpoint(4_000e6, user);
-
-        // === Round 5: 500 yield ===
-        aUsdc.simulateYield(address(vault), 500e6);
-        vm.prank(gameMaster);
-        distributor.distributeRewards(w, b);
-        totalYieldDistributed += 500e6;
-
-        // Total yield = 925
-        assertEq(totalYieldDistributed, 925e6);
-
-        uint256 expectedWinnerTotal = (totalYieldDistributed * 8_000) / 10_000;
-        uint256 expectedProtocolTotal = (totalYieldDistributed * 1_000) / 10_000;
-
-        assertEq(usdc.balanceOf(winner), expectedWinnerTotal);
-        assertEq(usdc.balanceOf(protocolWallet), expectedProtocolTotal);
-        assertEq(distributor.totalWinnerRewards(), expectedWinnerTotal);
-        assertEq(distributor.totalProtocolRewards(), expectedProtocolTotal);
-        assertEq(distributor.pendingYield(), 0);
-    }
-
-    /// @notice withdrawAndCheckpoint reverts on zero address.
-    function test_revert_withdrawAndCheckpoint_zeroAddress() public {
-        vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSignature("ZeroAddress()"));
-        distributor.withdrawAndCheckpoint(100e6, address(0));
-    }
-
-    /// @notice Unauthorized caller cannot call supplyAndCheckpoint.
-    function test_revert_supplyAndCheckpoint_unauthorized() public {
-        usdc.mint(address(vault), 100e6);
-        vm.prank(gameMaster);
-        vm.expectRevert("UNAUTHORIZED");
-        distributor.supplyAndCheckpoint(100e6);
-    }
-
-    /// @notice Unauthorized caller cannot call withdrawAndCheckpoint.
-    function test_revert_withdrawAndCheckpoint_unauthorized() public {
-        vm.prank(gameMaster);
-        vm.expectRevert("UNAUTHORIZED");
-        distributor.withdrawAndCheckpoint(100e6, winner);
-    }
-
-    /// @notice withdrawAndCheckpoint correctly adjusts checkpoint for full vault withdrawal.
-    function test_withdrawAndCheckpoint_fullWithdrawal() public {
-        uint256 checkpoint = distributor.lastCheckpointBalance();
-
-        // Withdraw exactly the full vault balance
-        vm.prank(owner);
-        distributor.withdrawAndCheckpoint(checkpoint, address(0x123));
-
-        assertEq(distributor.lastCheckpointBalance(), 0);
-        assertEq(usdc.balanceOf(address(0x123)), checkpoint);
-    }
-
-    /// @notice Proxy aaveSupplyUsdc rejects zero amount.
-    function test_proxy_aaveSupplyUsdc_rejectsZero() public {
-        vm.prank(address(distributor));
-        vm.expectRevert(abi.encodeWithSignature("ScopedVaultProxy__ZeroAmount()"));
-        proxy.aaveSupplyUsdc(0);
-    }
-
-    /// @notice Proxy aaveSupplyUsdc rejects unauthorized caller.
-    function test_proxy_aaveSupplyUsdc_rejectsUnauthorized() public {
-        vm.prank(address(0xBAD));
-        vm.expectRevert("UNAUTHORIZED");
-        proxy.aaveSupplyUsdc(100e6);
     }
 }

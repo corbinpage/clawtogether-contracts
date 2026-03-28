@@ -3,8 +3,9 @@ pragma solidity ^0.8.21;
 
 import {Test} from "@forge-std/Test.sol";
 import {BoringVault} from "boring-vault/base/BoringVault.sol";
+import {ManagerWithMerkleVerification} from "boring-vault/base/Roles/ManagerWithMerkleVerification.sol";
 import {GameRewardsDistributor} from "../src/GameRewardsDistributor.sol";
-import {ScopedVaultProxy} from "../src/ScopedVaultProxy.sol";
+import {ClawTogetherDecoderAndSanitizer} from "../src/ClawTogetherDecoderAndSanitizer.sol";
 import {Authority} from "@solmate/auth/Auth.sol";
 import {RolesAuthority} from "@solmate/auth/authorities/RolesAuthority.sol";
 import {ERC20} from "@solmate/tokens/ERC20.sol";
@@ -50,13 +51,15 @@ contract MockAavePool {
 // ========================= INTEGRATION TESTS =========================
 
 /// @notice Full integration: Teller deposit, Aave supply, game rewards, DelayedWithdraw.
+///         Uses ManagerWithMerkleVerification instead of ScopedVaultProxy.
 contract IntegrationTest is Test {
     BoringVault vault;
     RolesAuthority auth;
     AccountantWithRateProviders accountant;
     TellerWithMultiAssetSupport teller;
     DelayedWithdraw delayedWithdraw;
-    ScopedVaultProxy proxy;
+    ManagerWithMerkleVerification manager;
+    ClawTogetherDecoderAndSanitizer decoder;
     GameRewardsDistributor distributor;
 
     MockUSDC usdc;
@@ -76,10 +79,44 @@ contract IntegrationTest is Test {
     uint8 constant DELAYED_WITHDRAW_ROLE = 3;
     uint8 constant OWNER_ROLE = 8;
     uint8 constant GAME_MASTER_ROLE = 20;
-    uint8 constant DISTRIBUTOR_ROLE = 21;
+    uint8 constant STRATEGIST_ROLE = 21;
 
     uint32 constant WITHDRAW_DELAY = 1 days;
     uint32 constant COMPLETION_WINDOW = 7 days;
+
+    // ========================= MERKLE TREE HELPERS =========================
+
+    function _hashPair(bytes32 a, bytes32 b) internal pure returns (bytes32) {
+        return a < b ? _efficientHash(a, b) : _efficientHash(b, a);
+    }
+
+    function _efficientHash(bytes32 a, bytes32 b) internal pure returns (bytes32 value) {
+        assembly {
+            mstore(0x00, a)
+            mstore(0x20, b)
+            value := keccak256(0x00, 0x40)
+        }
+    }
+
+    function _computeLeaf(
+        address _decoder, address target, bool valueNonZero, bytes4 selector, bytes memory packedAddresses
+    ) internal pure returns (bytes32) {
+        return keccak256(abi.encodePacked(_decoder, target, valueNonZero, selector, packedAddresses));
+    }
+
+    function _buildTree4(bytes32 l0, bytes32 l1, bytes32 l2, bytes32 l3)
+        internal pure returns (
+            bytes32 root, bytes32[] memory p0, bytes32[] memory p1, bytes32[] memory p2, bytes32[] memory p3
+        )
+    {
+        bytes32 h01 = _hashPair(l0, l1);
+        bytes32 h23 = _hashPair(l2, l3);
+        root = _hashPair(h01, h23);
+        p0 = new bytes32[](2); p0[0] = l1; p0[1] = h23;
+        p1 = new bytes32[](2); p1[0] = l0; p1[1] = h23;
+        p2 = new bytes32[](2); p2[0] = l3; p2[1] = h01;
+        p3 = new bytes32[](2); p3[0] = l2; p3[1] = h01;
+    }
 
     function setUp() public {
         usdc = new MockUSDC();
@@ -104,12 +141,17 @@ contract IntegrationTest is Test {
         // Deploy DelayedWithdraw
         delayedWithdraw = new DelayedWithdraw(owner, address(vault), address(accountant), owner);
 
-        // Deploy ScopedVaultProxy
-        proxy = new ScopedVaultProxy(owner, auth, vault, address(usdc), address(aavePool));
+        // Deploy Manager (balancerVault = address(0))
+        manager = new ManagerWithMerkleVerification(owner, address(vault), address(0));
+        manager.setAuthority(auth);
+
+        // Deploy Decoder
+        decoder = new ClawTogetherDecoderAndSanitizer(address(vault));
 
         // Deploy GameRewardsDistributor
         distributor = new GameRewardsDistributor(
-            owner, auth, vault, ERC20(address(usdc)), ERC20(address(aUsdc)), proxy, protocolWallet
+            owner, auth, vault, ERC20(address(usdc)), ERC20(address(aUsdc)),
+            manager, address(decoder), address(aavePool), protocolWallet
         );
 
         // Point Veda contracts to shared authority
@@ -119,8 +161,8 @@ contract IntegrationTest is Test {
 
         // ========================= PERMISSIONS =========================
 
-        // ScopedVaultProxy -> vault.manage()
-        auth.setUserRole(address(proxy), MANAGER_ROLE, true);
+        // Manager -> vault.manage()
+        auth.setUserRole(address(manager), MANAGER_ROLE, true);
         auth.setRoleCapability(
             MANAGER_ROLE, address(vault), bytes4(keccak256("manage(address,bytes,uint256)")), true
         );
@@ -128,7 +170,8 @@ contract IntegrationTest is Test {
         // Teller -> vault.enter()
         auth.setUserRole(address(teller), TELLER_ROLE, true);
         auth.setRoleCapability(
-            TELLER_ROLE, address(vault), bytes4(keccak256("enter(address,address,uint256,address,uint256)")), true
+            TELLER_ROLE, address(vault),
+            bytes4(keccak256("enter(address,address,uint256,address,uint256)")), true
         );
 
         // DelayedWithdraw -> vault.exit()
@@ -138,10 +181,12 @@ contract IntegrationTest is Test {
             bytes4(keccak256("exit(address,address,uint256,address,uint256)")), true
         );
 
-        // Distributor -> proxy
-        auth.setUserRole(address(distributor), DISTRIBUTOR_ROLE, true);
-        auth.setRoleCapability(DISTRIBUTOR_ROLE, address(proxy), ScopedVaultProxy.aaveWithdrawUsdc.selector, true);
-        auth.setRoleCapability(DISTRIBUTOR_ROLE, address(proxy), ScopedVaultProxy.vaultTransferUsdc.selector, true);
+        // Distributor -> manager.manageVaultWithMerkleVerification
+        auth.setUserRole(address(distributor), STRATEGIST_ROLE, true);
+        auth.setRoleCapability(
+            STRATEGIST_ROLE, address(manager),
+            ManagerWithMerkleVerification.manageVaultWithMerkleVerification.selector, true
+        );
 
         // GameMaster -> distributeRewards
         auth.setUserRole(gameMaster, GAME_MASTER_ROLE, true);
@@ -156,6 +201,7 @@ contract IntegrationTest is Test {
         auth.setRoleCapability(OWNER_ROLE, address(distributor), GameRewardsDistributor.resetCheckpoint.selector, true);
         auth.setRoleCapability(OWNER_ROLE, address(distributor), GameRewardsDistributor.setPaused.selector, true);
         auth.setRoleCapability(OWNER_ROLE, address(distributor), GameRewardsDistributor.adjustCheckpoint.selector, true);
+        auth.setRoleCapability(OWNER_ROLE, address(distributor), GameRewardsDistributor.setMerkleProofs.selector, true);
 
         // Public capabilities
         auth.setPublicCapability(address(teller), TellerWithMultiAssetSupport.deposit.selector, true);
@@ -177,6 +223,11 @@ contract IntegrationTest is Test {
         aUsdc.mint(address(vault), 1_000_000e6);
         vm.prank(address(vault));
         aUsdc.approve(address(aavePool), type(uint256).max);
+        vm.prank(address(vault));
+        usdc.approve(address(aavePool), type(uint256).max);
+
+        // Build Merkle tree and set proofs
+        _setupMerkleTree();
 
         // Reset checkpoint after seeding
         vm.prank(owner);
@@ -185,6 +236,42 @@ contract IntegrationTest is Test {
         // Give users USDC
         usdc.mint(alice, 10_000e6);
         usdc.mint(bob, 5_000e6);
+    }
+
+    function _setupMerkleTree() internal {
+        bytes32 approveLeaf = _computeLeaf(
+            address(decoder), address(usdc), false,
+            bytes4(keccak256("approve(address,uint256)")),
+            abi.encodePacked(address(aavePool))
+        );
+        bytes32 supplyLeaf = _computeLeaf(
+            address(decoder), address(aavePool), false,
+            bytes4(keccak256("supply(address,uint256,address,uint16)")),
+            abi.encodePacked(address(usdc), address(vault))
+        );
+        bytes32 withdrawLeaf = _computeLeaf(
+            address(decoder), address(aavePool), false,
+            bytes4(keccak256("withdraw(address,uint256,address)")),
+            abi.encodePacked(address(usdc), address(vault))
+        );
+        bytes32 transferLeaf = _computeLeaf(
+            address(decoder), address(usdc), false,
+            bytes4(keccak256("transfer(address,uint256)")),
+            abi.encodePacked(address(distributor))
+        );
+
+        (
+            bytes32 root,
+            bytes32[] memory approveProof,
+            bytes32[] memory supplyProof,
+            bytes32[] memory withdrawProof,
+            bytes32[] memory transferProof
+        ) = _buildTree4(approveLeaf, supplyLeaf, withdrawLeaf, transferLeaf);
+
+        vm.startPrank(owner);
+        manager.setManageRoot(address(distributor), root);
+        distributor.setMerkleProofs(approveProof, supplyProof, withdrawProof, transferProof);
+        vm.stopPrank();
     }
 
     // ========================= DEPOSIT VIA TELLER =========================
@@ -203,13 +290,11 @@ contract IntegrationTest is Test {
     // ========================= DELAYED WITHDRAWAL =========================
 
     function test_delayedWithdraw_fullCycle() public {
-        // Alice deposits
         vm.startPrank(alice);
         usdc.approve(address(vault), 1_000e6);
         uint256 shares = teller.deposit(ERC20(address(usdc)), 1_000e6, 0);
         vm.stopPrank();
 
-        // Request withdrawal
         vm.startPrank(alice);
         vault.approve(address(delayedWithdraw), shares);
         delayedWithdraw.requestWithdraw(ERC20(address(usdc)), uint96(shares), 100, true);
@@ -217,15 +302,13 @@ contract IntegrationTest is Test {
 
         assertEq(vault.balanceOf(alice), 0);
 
-        // Wait 1 day
         vm.warp(block.timestamp + WITHDRAW_DELAY);
 
-        // Complete withdrawal
         vm.prank(alice);
         uint256 assetsOut = delayedWithdraw.completeWithdraw(ERC20(address(usdc)), alice);
 
         assertEq(assetsOut, 1_000e6);
-        assertEq(usdc.balanceOf(alice), 10_000e6); // Original balance restored
+        assertEq(usdc.balanceOf(alice), 10_000e6);
     }
 
     function test_delayedWithdraw_revertsBeforeDelay() public {
@@ -236,7 +319,6 @@ contract IntegrationTest is Test {
         vault.approve(address(delayedWithdraw), shares);
         delayedWithdraw.requestWithdraw(ERC20(address(usdc)), uint96(shares), 100, true);
 
-        // Try to complete immediately
         vm.expectRevert();
         delayedWithdraw.completeWithdraw(ERC20(address(usdc)), alice);
         vm.stopPrank();
@@ -268,12 +350,11 @@ contract IntegrationTest is Test {
 
         vm.warp(block.timestamp + WITHDRAW_DELAY);
 
-        // Bob completes Alice's withdrawal
         vm.prank(bob);
         uint256 assetsOut = delayedWithdraw.completeWithdraw(ERC20(address(usdc)), alice);
 
         assertEq(assetsOut, 1_000e6);
-        assertEq(usdc.balanceOf(alice), 10_000e6); // Alice gets USDC
+        assertEq(usdc.balanceOf(alice), 10_000e6);
     }
 
     function test_viewOutstandingDebt() public {
@@ -319,19 +400,16 @@ contract IntegrationTest is Test {
         delayedWithdraw.requestWithdraw(ERC20(address(usdc)), uint96(shares), 100, true);
         vm.stopPrank();
 
-        // Wait 1 day
         vm.warp(block.timestamp + WITHDRAW_DELAY);
 
-        // Alice completes
         vm.prank(alice);
         uint256 assetsOut = delayedWithdraw.completeWithdraw(ERC20(address(usdc)), alice);
 
         assertEq(assetsOut, 2_000e6);
-        assertEq(usdc.balanceOf(alice), 10_000e6); // 10000 - 2000 + 2000 back
+        assertEq(usdc.balanceOf(alice), 10_000e6);
     }
 
     function test_multipleDepositors_withdraw() public {
-        // Both deposit
         vm.startPrank(alice);
         usdc.approve(address(vault), 5_000e6);
         uint256 aliceShares = teller.deposit(ERC20(address(usdc)), 5_000e6, 0);
@@ -342,7 +420,6 @@ contract IntegrationTest is Test {
         uint256 bobShares = teller.deposit(ERC20(address(usdc)), 3_000e6, 0);
         vm.stopPrank();
 
-        // Both request withdrawal
         vm.startPrank(alice);
         vault.approve(address(delayedWithdraw), aliceShares);
         delayedWithdraw.requestWithdraw(ERC20(address(usdc)), uint96(aliceShares), 100, true);
@@ -353,11 +430,9 @@ contract IntegrationTest is Test {
         delayedWithdraw.requestWithdraw(ERC20(address(usdc)), uint96(bobShares), 100, true);
         vm.stopPrank();
 
-        // Check outstanding debt
         uint256 debt = delayedWithdraw.viewOutstandingDebt(ERC20(address(usdc)));
         assertEq(debt, 8_000e6);
 
-        // Wait and complete
         vm.warp(block.timestamp + WITHDRAW_DELAY);
 
         vm.prank(alice);
