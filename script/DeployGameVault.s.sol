@@ -186,6 +186,9 @@ contract DeployGameVault is Script {
         rolesAuthority.setRoleCapability(
             OWNER_ROLE, address(distributor), GameRewardsDistributor.setPaused.selector, true
         );
+        rolesAuthority.setRoleCapability(
+            OWNER_ROLE, address(distributor), GameRewardsDistributor.adjustCheckpoint.selector, true
+        );
 
         // Owner admin on Teller
         rolesAuthority.setRoleCapability(

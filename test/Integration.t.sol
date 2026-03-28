@@ -155,6 +155,7 @@ contract IntegrationTest is Test {
         auth.setRoleCapability(OWNER_ROLE, address(distributor), GameRewardsDistributor.setFeeSplits.selector, true);
         auth.setRoleCapability(OWNER_ROLE, address(distributor), GameRewardsDistributor.resetCheckpoint.selector, true);
         auth.setRoleCapability(OWNER_ROLE, address(distributor), GameRewardsDistributor.setPaused.selector, true);
+        auth.setRoleCapability(OWNER_ROLE, address(distributor), GameRewardsDistributor.adjustCheckpoint.selector, true);
 
         // Public capabilities
         auth.setPublicCapability(address(teller), TellerWithMultiAssetSupport.deposit.selector, true);
@@ -295,8 +296,12 @@ contract IntegrationTest is Test {
         aUsdc.simulateYield(address(vault), 1000e6);
 
         // GameMaster distributes rewards
+        address[] memory winners = new address[](1);
+        uint256[] memory bps = new uint256[](1);
+        winners[0] = winner;
+        bps[0] = 10_000;
         vm.prank(gameMaster);
-        distributor.distributeRewards(winner);
+        distributor.distributeRewards(winners, bps);
 
         // Winner got 80%, protocol got 10%
         assertEq(usdc.balanceOf(winner), 800e6);

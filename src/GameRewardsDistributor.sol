@@ -7,9 +7,9 @@ import {ERC20} from "@solmate/tokens/ERC20.sol";
 import {Auth, Authority} from "@solmate/auth/Auth.sol";
 
 /// @title GameRewardsDistributor
-/// @notice Distributes accrued Aave yield from a BoringVault to a game winner,
-///         a protocol wallet, and vault depositors. Designed to sit alongside
-///         Veda's Boring Vault architecture on Base.
+/// @notice Distributes accrued Aave yield from a BoringVault to up to 10 game
+///         winners, a protocol wallet, and vault depositors. Designed to sit
+///         alongside Veda's Boring Vault architecture on Base.
 contract GameRewardsDistributor is Auth {
     // ========================= ERRORS =========================
 
@@ -18,12 +18,15 @@ contract GameRewardsDistributor is Auth {
     error NoYieldToDistribute();
     error Reentrancy();
     error Paused();
+    error TooManyWinners();
+    error ArrayLengthMismatch();
+    error WinnerBpsMustTotal10000();
 
     // ========================= EVENTS =========================
 
     event RewardsDistributed(
-        address indexed winner,
-        uint256 winnerAmount,
+        address[] winners,
+        uint256[] winnerAmounts,
         uint256 protocolAmount,
         uint256 vaultAmount,
         uint256 totalYield
@@ -31,7 +34,6 @@ contract GameRewardsDistributor is Auth {
     event ProtocolWalletUpdated(address indexed oldWallet, address indexed newWallet);
     event FeeSplitsUpdated(uint256 protocolBps, uint256 vaultBps);
     event CheckpointUpdated(uint256 oldCheckpoint, uint256 newCheckpoint);
-    event GameMasterUpdated(address indexed gameMaster, bool granted);
     event PauseToggled(bool isPaused);
 
     // ========================= CONSTANTS =========================
@@ -39,6 +41,7 @@ contract GameRewardsDistributor is Auth {
     uint256 public constant BPS_DENOMINATOR = 10_000;
     uint256 public constant MAX_PROTOCOL_BPS = 5_000;
     uint256 public constant MAX_VAULT_BPS = 5_000;
+    uint256 public constant MAX_WINNERS = 10;
 
     // ========================= IMMUTABLES =========================
 
@@ -59,6 +62,7 @@ contract GameRewardsDistributor is Auth {
     uint256 public vaultBps = 1_000; // 10%
 
     /// @notice aUSDC balance of the vault at last checkpoint.
+    ///         Updated on: distributeRewards, resetCheckpoint, adjustCheckpoint.
     uint256 public lastCheckpointBalance;
 
     /// @notice Pause flag for distributeRewards.
@@ -139,10 +143,29 @@ contract GameRewardsDistributor is Auth {
 
     /// @notice Distributes accrued Aave yield since the last checkpoint.
     /// @dev Callable by GAME_MASTER_ROLE (set via RolesAuthority).
-    ///      The winner's share is (BPS_DENOMINATOR - protocolBps - vaultBps).
-    /// @param winner Address that receives the winner's share of yield.
-    function distributeRewards(address winner) external requiresAuth nonReentrant whenNotPaused {
-        if (winner == address(0)) revert ZeroAddress();
+    ///      The total winner share is (BPS_DENOMINATOR - protocolBps - vaultBps).
+    ///      That share is then split among `winners` according to `winnerBps`.
+    /// @param winners   Array of winner addresses (max 10).
+    /// @param winnerBps Array of bps values that must sum to 10000. Each entry
+    ///                  specifies what % of the total winner share goes to that winner.
+    function distributeRewards(address[] calldata winners, uint256[] calldata winnerBps)
+        external
+        requiresAuth
+        nonReentrant
+        whenNotPaused
+    {
+        if (winners.length == 0 || winners.length > MAX_WINNERS) revert TooManyWinners();
+        if (winners.length != winnerBps.length) revert ArrayLengthMismatch();
+
+        // Validate winner bps sum to 10000
+        {
+            uint256 bpsSum;
+            for (uint256 i; i < winners.length; ++i) {
+                if (winners[i] == address(0)) revert ZeroAddress();
+                bpsSum += winnerBps[i];
+            }
+            if (bpsSum != BPS_DENOMINATOR) revert WinnerBpsMustTotal10000();
+        }
 
         uint256 currentBalance = A_USDC.balanceOf(address(VAULT));
         if (currentBalance <= lastCheckpointBalance) revert NoYieldToDistribute();
@@ -151,40 +174,78 @@ contract GameRewardsDistributor is Auth {
 
         uint256 protocolAmount = (totalYield * protocolBps) / BPS_DENOMINATOR;
         uint256 vaultAmount = (totalYield * vaultBps) / BPS_DENOMINATOR;
-        uint256 winnerAmount = totalYield - protocolAmount - vaultAmount;
-
-        uint256 withdrawAmount = winnerAmount + protocolAmount;
+        uint256 totalWinnerAmount = totalYield - protocolAmount - vaultAmount;
 
         // --- Effects: update checkpoint BEFORE external calls (CEI pattern) ---
-        uint256 expectedNewCheckpoint = currentBalance - withdrawAmount;
-        emit CheckpointUpdated(lastCheckpointBalance, expectedNewCheckpoint);
-        lastCheckpointBalance = expectedNewCheckpoint;
+        {
+            uint256 withdrawAmount = totalWinnerAmount + protocolAmount;
+            uint256 expectedNewCheckpoint = currentBalance - withdrawAmount;
+            emit CheckpointUpdated(lastCheckpointBalance, expectedNewCheckpoint);
+            lastCheckpointBalance = expectedNewCheckpoint;
+        }
 
-        // Track cumulative rewards
-        _recordReward(winner, winnerAmount);
+        // Calculate per-winner amounts
+        uint256[] memory winnerAmounts = _calcWinnerAmounts(winners.length, winnerBps, totalWinnerAmount);
+
+        // Track rewards
+        for (uint256 i; i < winners.length; ++i) {
+            _recordReward(winners[i], winnerAmounts[i]);
+        }
         _recordReward(protocolWallet, protocolAmount);
-        totalWinnerRewards += winnerAmount;
+        totalWinnerRewards += totalWinnerAmount;
         totalProtocolRewards += protocolAmount;
         totalVaultRewards += vaultAmount;
 
         // --- Interactions: external calls via scoped proxy ---
+        _executeTransfers(winners, winnerAmounts, protocolAmount);
 
-        // Step 1: Withdraw from Aave (reverts if actual < requested)
+        emit RewardsDistributed(winners, winnerAmounts, protocolAmount, vaultAmount, totalYield);
+    }
+
+    /// @dev Calculates per-winner amounts from bps splits. Last winner gets
+    ///      remainder to avoid dust from rounding.
+    function _calcWinnerAmounts(
+        uint256 count,
+        uint256[] calldata winnerBps,
+        uint256 totalWinnerAmount
+    ) internal pure returns (uint256[] memory amounts) {
+        amounts = new uint256[](count);
+        uint256 distributed;
+        for (uint256 i; i < count; ++i) {
+            if (i == count - 1) {
+                amounts[i] = totalWinnerAmount - distributed;
+            } else {
+                amounts[i] = (totalWinnerAmount * winnerBps[i]) / BPS_DENOMINATOR;
+                distributed += amounts[i];
+            }
+        }
+    }
+
+    /// @dev Withdraws from Aave and transfers USDC to winners and protocol wallet.
+    function _executeTransfers(
+        address[] calldata winners,
+        uint256[] memory winnerAmounts,
+        uint256 protocolAmount
+    ) internal {
+        // Step 1: Withdraw from Aave
+        uint256 withdrawAmount;
+        for (uint256 i; i < winnerAmounts.length; ++i) {
+            withdrawAmount += winnerAmounts[i];
+        }
+        withdrawAmount += protocolAmount;
         PROXY.aaveWithdrawUsdc(withdrawAmount);
 
-        // Step 2: Transfer winner's share
-        if (winnerAmount > 0) {
-            PROXY.vaultTransferUsdc(winner, winnerAmount);
+        // Step 2: Transfer each winner's share
+        for (uint256 i; i < winners.length; ++i) {
+            if (winnerAmounts[i] > 0) {
+                PROXY.vaultTransferUsdc(winners[i], winnerAmounts[i]);
+            }
         }
 
         // Step 3: Transfer protocol's share
         if (protocolAmount > 0) {
             PROXY.vaultTransferUsdc(protocolWallet, protocolAmount);
         }
-
-        // Step 4: vaultAmount stays as aUSDC in the vault -- no action needed.
-
-        emit RewardsDistributed(winner, winnerAmount, protocolAmount, vaultAmount, totalYield);
     }
 
     // ========================= ADMIN =========================
@@ -198,7 +259,7 @@ contract GameRewardsDistributor is Auth {
     }
 
     /// @notice Update the fee split between protocol and vault depositors.
-    /// @dev The winner always gets (10000 - protocolBps - vaultBps).
+    /// @dev The winners always get (10000 - protocolBps - vaultBps) collectively.
     ///      Callable by OWNER_ROLE.
     /// @param _protocolBps Basis points for the protocol wallet.
     /// @param _vaultBps    Basis points that stay in the vault for depositors.
@@ -218,6 +279,29 @@ contract GameRewardsDistributor is Auth {
     function resetCheckpoint() external requiresAuth {
         uint256 newCheckpoint = A_USDC.balanceOf(address(VAULT));
         emit CheckpointUpdated(lastCheckpointBalance, newCheckpoint);
+        lastCheckpointBalance = newCheckpoint;
+    }
+
+    /// @notice Adjust the checkpoint by a signed delta when deposits or withdrawals
+    ///         change the vault's aUSDC balance outside of yield accrual.
+    ///         Call with positive delta after new USDC is supplied to Aave (deposit),
+    ///         or negative delta after USDC is withdrawn from Aave (user withdrawal).
+    /// @dev Callable by OWNER_ROLE or OPERATOR_ROLE. This ensures that user
+    ///      deposits/withdrawals are not mistakenly counted as yield.
+    /// @param delta Signed change to apply to the checkpoint.
+    function adjustCheckpoint(int256 delta) external requiresAuth {
+        uint256 oldCheckpoint = lastCheckpointBalance;
+        uint256 newCheckpoint;
+
+        if (delta >= 0) {
+            newCheckpoint = oldCheckpoint + uint256(delta);
+        } else {
+            uint256 absDelta = uint256(-delta);
+            // If withdrawal exceeds checkpoint (shouldn't happen), floor to 0
+            newCheckpoint = absDelta > oldCheckpoint ? 0 : oldCheckpoint - absDelta;
+        }
+
+        emit CheckpointUpdated(oldCheckpoint, newCheckpoint);
         lastCheckpointBalance = newCheckpoint;
     }
 
