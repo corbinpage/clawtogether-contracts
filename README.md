@@ -117,7 +117,9 @@ User (Public)
   └─ delayedWithdraw.completeWithdraw()
 
 GameMaster EOA
-  └─ distributor.distributeRewards(winner)
+  ├─ distributor.distributeRewards(winner)
+  ├─ distributor.supplyAndCheckpoint(amount)
+  └─ distributor.withdrawAndCheckpoint(amount, to)
 
 Owner EOA
   ├─ distributor: setProtocolWallet, setFeeSplits, resetCheckpoint, setPaused

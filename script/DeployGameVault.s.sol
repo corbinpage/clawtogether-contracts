@@ -159,9 +159,11 @@ contract DeployGameVault is Script {
         _auth.setUserRole(address(_distributor), STRATEGIST_ROLE, true);
         _auth.setRoleCapability(STRATEGIST_ROLE, address(_manager), ManagerWithMerkleVerification.manageVaultWithMerkleVerification.selector, true);
 
-        // GameMaster -> distributeRewards
+        // GameMaster -> distributeRewards, supplyAndCheckpoint, withdrawAndCheckpoint
         _auth.setUserRole(gameMaster, GAME_MASTER_ROLE, true);
         _auth.setRoleCapability(GAME_MASTER_ROLE, address(_distributor), GameRewardsDistributor.distributeRewards.selector, true);
+        _auth.setRoleCapability(GAME_MASTER_ROLE, address(_distributor), GameRewardsDistributor.supplyAndCheckpoint.selector, true);
+        _auth.setRoleCapability(GAME_MASTER_ROLE, address(_distributor), GameRewardsDistributor.withdrawAndCheckpoint.selector, true);
 
         // Owner admin
         _auth.setUserRole(owner, OWNER_ROLE, true);
@@ -171,7 +173,5 @@ contract DeployGameVault is Script {
         _auth.setRoleCapability(OWNER_ROLE, address(_distributor), GameRewardsDistributor.setPaused.selector, true);
         _auth.setRoleCapability(OWNER_ROLE, address(_distributor), GameRewardsDistributor.adjustCheckpoint.selector, true);
         _auth.setRoleCapability(OWNER_ROLE, address(_distributor), GameRewardsDistributor.setMerkleProofs.selector, true);
-        _auth.setRoleCapability(OWNER_ROLE, address(_distributor), GameRewardsDistributor.supplyAndCheckpoint.selector, true);
-        _auth.setRoleCapability(OWNER_ROLE, address(_distributor), GameRewardsDistributor.withdrawAndCheckpoint.selector, true);
     }
 }

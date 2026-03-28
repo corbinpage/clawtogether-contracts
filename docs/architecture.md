@@ -41,8 +41,8 @@ graph TB
     DELAYED -->|"after 1-day delay<br/>burn shares, return USDC"| USER
 
     GM -->|"distributeRewards(winners, bps)"| DIST
-    OW -->|"supplyAndCheckpoint(amount)"| DIST
-    OW -->|"withdrawAndCheckpoint(amount, to)"| DIST
+    GM -->|"supplyAndCheckpoint(amount)"| DIST
+    GM -->|"withdrawAndCheckpoint(amount, to)"| DIST
     OW -->|"setFeeSplits / setPaused<br/>resetCheckpoint / adjustCheckpoint"| DIST
 
     DIST -->|"manageVaultWithMerkleVerification<br/>(proofs + calldata)"| MANAGER
@@ -131,7 +131,7 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     autonumber
-    participant OP as Owner / Operator
+    participant GM as Game Master
     participant DIST as GameRewardsDistributor
     participant MGR as ManagerWithMerkleVerification
     participant VAULT as BoringVault
@@ -139,7 +139,7 @@ sequenceDiagram
 
     Note over VAULT: USDC already in vault<br/>(from user deposit via Teller)
 
-    OP->>DIST: supplyAndCheckpoint(amount)
+    GM->>DIST: supplyAndCheckpoint(amount)
     activate DIST
 
     DIST->>MGR: manageVaultWithMerkleVerification<br/>(approve + supply proofs)
@@ -162,14 +162,14 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     autonumber
-    participant OP as Owner / Operator
+    participant GM as Game Master
     participant DIST as GameRewardsDistributor
     participant MGR as ManagerWithMerkleVerification
     participant VAULT as BoringVault
     participant AAVE as Aave V3 Pool
     participant USER as Recipient
 
-    OP->>DIST: withdrawAndCheckpoint(amount, user)
+    GM->>DIST: withdrawAndCheckpoint(amount, user)
     activate DIST
 
     DIST->>MGR: manageVaultWithMerkleVerification<br/>(withdraw + transfer proofs)
@@ -252,8 +252,8 @@ graph LR
     end
 
     GMR -->|"can call"| DR
-    OWR -->|"can call"| SAC
-    OWR -->|"can call"| WAC
+    GMR -->|"can call"| SAC
+    GMR -->|"can call"| WAC
     OWR -->|"can call"| AC
     OWR -->|"can call"| RC
     OWR -->|"can call"| SPW

@@ -213,10 +213,10 @@ contract GameRewardsDistributorTest is Test {
             OWNER_ROLE, address(distributor), GameRewardsDistributor.setMerkleProofs.selector, true
         );
         rolesAuthority.setRoleCapability(
-            OWNER_ROLE, address(distributor), GameRewardsDistributor.supplyAndCheckpoint.selector, true
+            GAME_MASTER_ROLE, address(distributor), GameRewardsDistributor.supplyAndCheckpoint.selector, true
         );
         rolesAuthority.setRoleCapability(
-            OWNER_ROLE, address(distributor), GameRewardsDistributor.withdrawAndCheckpoint.selector, true
+            GAME_MASTER_ROLE, address(distributor), GameRewardsDistributor.withdrawAndCheckpoint.selector, true
         );
 
         vm.stopPrank();
@@ -686,7 +686,7 @@ contract GameRewardsDistributorTest is Test {
     function test_supplyAndCheckpoint_basic() public {
         uint256 checkpointBefore = distributor.lastCheckpointBalance();
         usdc.mint(address(vault), 500e6);
-        vm.prank(owner);
+        vm.prank(gameMaster);
         distributor.supplyAndCheckpoint(500e6);
         assertEq(distributor.lastCheckpointBalance(), checkpointBefore + 500e6);
         assertEq(distributor.pendingYield(), 0);
@@ -695,7 +695,7 @@ contract GameRewardsDistributorTest is Test {
     function test_withdrawAndCheckpoint_basic() public {
         uint256 checkpointBefore = distributor.lastCheckpointBalance();
         address user = address(0x123);
-        vm.prank(owner);
+        vm.prank(gameMaster);
         distributor.withdrawAndCheckpoint(200e6, user);
         assertEq(distributor.lastCheckpointBalance(), checkpointBefore - 200e6);
         assertEq(usdc.balanceOf(user), 200e6);
@@ -704,7 +704,7 @@ contract GameRewardsDistributorTest is Test {
 
     function test_supplyAndCheckpoint_cannotCreatePhantomYield() public {
         usdc.mint(address(vault), 5_000e6);
-        vm.prank(owner);
+        vm.prank(gameMaster);
         distributor.supplyAndCheckpoint(5_000e6);
         assertEq(distributor.pendingYield(), 0);
 
@@ -716,11 +716,11 @@ contract GameRewardsDistributorTest is Test {
 
     function test_supplyAndCheckpoint_multipleSupplies_thenYield() public {
         usdc.mint(address(vault), 1_000e6);
-        vm.prank(owner);
+        vm.prank(gameMaster);
         distributor.supplyAndCheckpoint(1_000e6);
 
         usdc.mint(address(vault), 2_000e6);
-        vm.prank(owner);
+        vm.prank(gameMaster);
         distributor.supplyAndCheckpoint(2_000e6);
 
         aUsdc.simulateYield(address(vault), 300e6);
@@ -736,7 +736,7 @@ contract GameRewardsDistributorTest is Test {
 
     function test_withdrawAndCheckpoint_thenYield() public {
         address user = address(0x123);
-        vm.prank(owner);
+        vm.prank(gameMaster);
         distributor.withdrawAndCheckpoint(500_000e6, user);
         assertEq(distributor.pendingYield(), 0);
 
@@ -759,10 +759,10 @@ contract GameRewardsDistributorTest is Test {
         assertEq(usdc.balanceOf(winner), 160e6);
 
         usdc.mint(address(vault), 3_000e6);
-        vm.prank(owner);
+        vm.prank(gameMaster);
         distributor.supplyAndCheckpoint(3_000e6);
 
-        vm.prank(owner);
+        vm.prank(gameMaster);
         distributor.withdrawAndCheckpoint(1_000e6, user);
 
         assertEq(distributor.pendingYield(), 0);
@@ -776,27 +776,27 @@ contract GameRewardsDistributorTest is Test {
 
     function test_withdrawAndCheckpoint_fullWithdrawal() public {
         uint256 checkpoint = distributor.lastCheckpointBalance();
-        vm.prank(owner);
+        vm.prank(gameMaster);
         distributor.withdrawAndCheckpoint(checkpoint, address(0x123));
         assertEq(distributor.lastCheckpointBalance(), 0);
         assertEq(usdc.balanceOf(address(0x123)), checkpoint);
     }
 
     function test_revert_withdrawAndCheckpoint_zeroAddress() public {
-        vm.prank(owner);
+        vm.prank(gameMaster);
         vm.expectRevert(abi.encodeWithSignature("ZeroAddress()"));
         distributor.withdrawAndCheckpoint(100e6, address(0));
     }
 
     function test_revert_supplyAndCheckpoint_unauthorized() public {
         usdc.mint(address(vault), 100e6);
-        vm.prank(gameMaster);
+        vm.prank(address(0xdead));
         vm.expectRevert("UNAUTHORIZED");
         distributor.supplyAndCheckpoint(100e6);
     }
 
     function test_revert_withdrawAndCheckpoint_unauthorized() public {
-        vm.prank(gameMaster);
+        vm.prank(address(0xdead));
         vm.expectRevert("UNAUTHORIZED");
         distributor.withdrawAndCheckpoint(100e6, winner);
     }
