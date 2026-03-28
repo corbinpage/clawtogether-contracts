@@ -11,13 +11,13 @@ A DeFi game vault built on [Veda's Boring Vault](https://github.com/Se7en-Seas/b
 +--+--------+--------+--------+---------+--------+-----------------------+
    |        |        |        |         |        |
    v        v        v        v         v        v
-+------+ +------+ +------+ +--------+ +-----+ +----------+
-|Boring| |Accoun| |Teller| |Delayed | |Scope| |GameReward|
-|Vault | |tant  | |      | |Withdraw| |Proxy| |Distribut.|<-- GameMaster
-|(gyvUSDC)       |      | |(1 day) | |     | |          |
-+------+ +------+ +------+ +--------+ +-----+ +----------+
-   ^        |   enter()|  exit()  | manage()|      |
-   +--------+----------+----------+---------+------+
++------+ +------+ +------+ +--------+ +-------+ +----------+
+|Boring| |Accoun| |Teller| |Delayed | |Manager| |GameReward|
+|Vault | |tant  | |      | |Withdraw| |Merkle | |Distribut.|<-- GameMaster
+|(clawUSDC)       |      | |(1 day) | |Verify | |          |
++------+ +------+ +------+ +--------+ +-------+ +----------+
+   ^        |   enter()|  exit()  | manage() |      |
+   +--------+----------+----------+----------+------+
 ```
 
 ### How It Works
@@ -25,10 +25,10 @@ A DeFi game vault built on [Veda's Boring Vault](https://github.com/Se7en-Seas/b
 **Depositing:**
 1. User approves USDC to the vault address
 2. User calls `teller.deposit(USDC, amount, minimumShares)`
-3. Teller calls `vault.enter()` -- USDC transfers in, `gyvUSDC` shares mint to user
+3. Teller calls `vault.enter()` -- USDC transfers in, `clawUSDC` shares mint to user
 
 **Earning Yield:**
-1. Vault's USDC is supplied to Aave V3 (via ScopedVaultProxy or external strategist)
+1. Vault's USDC is supplied to Aave V3 (via ManagerWithMerkleVerification or external strategist)
 2. Aave yield accrues as the vault's aUSDC balance grows
 
 **Game Rewards (per round):**
@@ -46,7 +46,7 @@ A DeFi game vault built on [Veda's Boring Vault](https://github.com/Se7en-Seas/b
 
 ### `BoringVault` (Veda)
 
-ERC20 vault token (`gyvUSDC`, 6 decimals) and asset custodian. Holds aUSDC and USDC. All external calls go through `manage()`, gated by `requiresAuth`.
+ERC20 vault token (`clawUSDC`, 6 decimals) and asset custodian. Holds aUSDC and USDC. All external calls go through `manage()`, gated by `requiresAuth`.
 
 ### `AccountantWithRateProviders` (Veda)
 
@@ -68,14 +68,20 @@ Handles user withdrawals with a 1-day time delay.
 | Max loss | 1% | Max exchange rate slippage allowed |
 | Pull from vault | true | Pulls USDC from vault on completion |
 
-### `ScopedVaultProxy` -- [`src/ScopedVaultProxy.sol`](src/ScopedVaultProxy.sol)
+### `ManagerWithMerkleVerification` (Veda)
 
-Tightly scoped intermediary that holds `MANAGER_ROLE` on the vault but only exposes two hardcoded operations:
+Merkle tree-based permission system that holds `MANAGER_ROLE` on the vault. Each allowed vault operation is a leaf in a Merkle tree (target address + decoder + function selector). The `GameRewardsDistributor` calls `manageVaultWithMerkleVerification()` with proofs to execute scoped operations. Four leaves are configured:
 
-| Function | What it does |
+| Leaf | Operation |
 |---|---|
-| `aaveWithdrawUsdc(amount)` | Calls `Pool.withdraw(USDC, amount, vault)` -- always withdraws USDC, always to the vault |
-| `vaultTransferUsdc(to, amount)` | Calls `USDC.transfer(to, amount)` from the vault |
+| `approve` | `USDC.approve(aavePool, amount)` |
+| `supply` | `Pool.supply(USDC, amount, vault, 0)` |
+| `withdraw` | `Pool.withdraw(USDC, amount, vault)` |
+| `transfer` | `USDC.transfer(distributor, amount)` |
+
+### `ClawTogetherDecoderAndSanitizer` -- [`src/ClawTogetherDecoderAndSanitizer.sol`](src/ClawTogetherDecoderAndSanitizer.sol)
+
+Extracts and validates address arguments from calldata for Merkle leaf verification. Combines Aave V3 decoder with the base decoder.
 
 ### `GameRewardsDistributor` -- [`src/GameRewardsDistributor.sol`](src/GameRewardsDistributor.sol)
 
@@ -122,12 +128,12 @@ Owner EOA
 
 | Role | ID | Assigned To | Purpose |
 |---|---|---|---|
-| `MANAGER_ROLE` | 1 | ScopedVaultProxy | `vault.manage()` |
+| `MANAGER_ROLE` | 1 | ManagerWithMerkleVerification | `vault.manage()` |
 | `TELLER_ROLE` | 2 | Teller | `vault.enter()` |
 | `DELAYED_WITHDRAW_ROLE` | 3 | DelayedWithdraw | `vault.exit()` |
 | `OWNER_ROLE` | 8 | Owner EOA | Admin config |
 | `GAME_MASTER_ROLE` | 20 | GameMaster EOA | `distributeRewards` |
-| `DISTRIBUTOR_ROLE` | 21 | GameRewardsDistributor | Proxy scoped calls |
+| `STRATEGIST_ROLE` | 21 | GameRewardsDistributor | `manager.manageVaultWithMerkleVerification` |
 
 ## Withdrawal Flow
 
@@ -168,7 +174,7 @@ forge build
 forge test -vvv
 ```
 
-34 tests total: 26 unit tests (GameRewardsDistributor + ScopedVaultProxy) + 8 integration tests (Teller deposit + DelayedWithdraw + game rewards).
+47 unit tests (GameRewardsDistributor) + 8 integration tests (Teller deposit + DelayedWithdraw + game rewards).
 
 ### Deploy
 
@@ -180,7 +186,12 @@ export GAME_MASTER=0x...
 forge script script/DeployGameVault.s.sol --rpc-url base --broadcast
 ```
 
-The deploy script handles the full system: BoringVault, Accountant, Teller, DelayedWithdraw, ScopedVaultProxy, GameRewardsDistributor, and all role/permission configuration.
+The deploy script handles the full system: BoringVault, Accountant, Teller, DelayedWithdraw, ManagerWithMerkleVerification, ClawTogetherDecoderAndSanitizer, GameRewardsDistributor, and all role/permission configuration.
+
+**Post-deploy (owner must do manually):**
+1. Compute Merkle tree (4 leaves: approve, supply, withdraw, transfer)
+2. Call `manager.setManageRoot(distributor, merkleRoot)`
+3. Call `distributor.setMerkleProofs(approveProof, supplyProof, withdrawProof, transferProof)`
 
 ### Post-Deployment Checklist
 

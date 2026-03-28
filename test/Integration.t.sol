@@ -125,7 +125,7 @@ contract IntegrationTest is Test {
         aavePool = new MockAavePool(usdc, aUsdc);
 
         auth = new RolesAuthority(owner, Authority(address(0)));
-        vault = new BoringVault(owner, "Game Yield Vault", "gyvUSDC", 6);
+        vault = new BoringVault(owner, "Game Yield Vault", "clawUSDC", 6);
 
         vm.startPrank(owner);
         vault.setAuthority(auth);

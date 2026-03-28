@@ -14,11 +14,12 @@ graph TB
         TELLER["TellerWithMultiAssetSupport<br/><i>deposit & mint shares</i>"]
         ACCOUNTANT["AccountantWithRateProviders<br/><i>share pricing & exchange rates</i>"]
         DELAYED["DelayedWithdraw<br/><i>1-day withdrawal queue</i>"]
-        VAULT["BoringVault<br/><i>holds aUSDC position</i><br/>gyvUSDC shares"]
+        VAULT["BoringVault<br/><i>holds aUSDC position</i><br/>clawUSDC shares"]
+        MANAGER["ManagerWithMerkleVerification<br/><i>Merkle-scoped vault operations</i>"]
     end
 
     subgraph ClawTogether Contracts
-        PROXY["ScopedVaultProxy<br/><i>MANAGER_ROLE on vault</i>"]
+        DECODER["ClawTogetherDecoderAndSanitizer<br/><i>calldata address extraction</i>"]
         DIST["GameRewardsDistributor<br/><i>yield accounting & distribution</i>"]
     end
 
@@ -35,7 +36,7 @@ graph TB
     end
 
     USER -->|"deposit USDC"| TELLER
-    TELLER -->|"mint gyvUSDC shares"| VAULT
+    TELLER -->|"mint clawUSDC shares"| VAULT
     USER -->|"request withdrawal"| DELAYED
     DELAYED -->|"after 1-day delay<br/>burn shares, return USDC"| USER
 
@@ -44,19 +45,19 @@ graph TB
     OW -->|"withdrawAndCheckpoint(amount, to)"| DIST
     OW -->|"setFeeSplits / setPaused<br/>resetCheckpoint / adjustCheckpoint"| DIST
 
-    DIST -->|"aaveSupplyUsdc(amount)"| PROXY
-    DIST -->|"aaveWithdrawUsdc(amount)"| PROXY
-    DIST -->|"vaultTransferUsdc(to, amount)"| PROXY
-
-    PROXY -->|"vault.manage(pool.supply)"| VAULT
-    PROXY -->|"vault.manage(pool.withdraw)"| VAULT
-    PROXY -->|"vault.manage(usdc.transfer)"| VAULT
+    DIST -->|"manageVaultWithMerkleVerification<br/>(proofs + calldata)"| MANAGER
+    MANAGER -->|"verify Merkle proof<br/>+ decode via"| DECODER
+    MANAGER -->|"vault.manage(approve)"| VAULT
+    MANAGER -->|"vault.manage(pool.supply)"| VAULT
+    MANAGER -->|"vault.manage(pool.withdraw)"| VAULT
+    MANAGER -->|"vault.manage(usdc.transfer)"| VAULT
 
     VAULT <-->|"supply / withdraw"| AAVE
     AAVE -->|"mints"| AUSDC
     AAVE -->|"returns"| USDC_TOK
-    VAULT -->|"USDC transfers"| WINNERS
-    VAULT -->|"USDC transfers"| PROTOCOL
+    VAULT -->|"USDC transfer"| DIST
+    DIST -->|"safeTransfer USDC"| WINNERS
+    DIST -->|"safeTransfer USDC"| PROTOCOL
     AUSDC -.->|"yield accrues<br/>(balance grows)"| DEPOSITORS
 
     ACCOUNTANT -.->|"rate oracle"| TELLER
@@ -70,8 +71,8 @@ graph TB
     classDef actor fill:#fffde7,stroke:#f9a825
 
     class GM,OW,USER actor
-    class TELLER,ACCOUNTANT,DELAYED,VAULT veda
-    class PROXY,DIST claw
+    class TELLER,ACCOUNTANT,DELAYED,VAULT,MANAGER veda
+    class DECODER,DIST claw
     class AAVE,USDC_TOK,AUSDC protocol
     class WINNERS,PROTOCOL,DEPOSITORS recipient
 ```
@@ -83,7 +84,7 @@ sequenceDiagram
     autonumber
     participant GM as Game Master
     participant DIST as GameRewardsDistributor
-    participant PROXY as ScopedVaultProxy
+    participant MGR as ManagerWithMerkleVerification
     participant VAULT as BoringVault
     participant AAVE as Aave V3 Pool
     participant W as Winners
@@ -104,23 +105,20 @@ sequenceDiagram
     Note over DIST: Update checkpoint BEFORE<br/>external calls (CEI pattern)
     DIST->>DIST: lastCheckpointBalance = newCheckpoint
 
-    DIST->>PROXY: aaveWithdrawUsdc(winnerTotal + protocolAmount)
-    activate PROXY
-    PROXY->>VAULT: manage(pool.withdraw)
+    DIST->>MGR: manageVaultWithMerkleVerification<br/>(withdraw + transfer proofs)
+    activate MGR
+    MGR->>VAULT: manage(pool.withdraw(USDC, amount, vault))
     VAULT->>AAVE: withdraw(USDC, amount, vault)
     AAVE-->>VAULT: USDC returned to vault
-    PROXY-->>DIST: actualAmount
-    deactivate PROXY
+    MGR->>VAULT: manage(usdc.transfer(distributor, amount))
+    VAULT-->>DIST: USDC transferred to distributor
+    deactivate MGR
 
     loop For each winner
-        DIST->>PROXY: vaultTransferUsdc(winner, amount)
-        PROXY->>VAULT: manage(usdc.transfer)
-        VAULT-->>W: USDC
+        DIST->>W: safeTransfer(USDC, winner, amount)
     end
 
-    DIST->>PROXY: vaultTransferUsdc(protocolWallet, protocolAmount)
-    PROXY->>VAULT: manage(usdc.transfer)
-    VAULT-->>P: USDC
+    DIST->>P: safeTransfer(USDC, protocolWallet, amount)
 
     Note over VAULT: vaultAmount stays as aUSDC<br/>(no action needed)
 
@@ -135,7 +133,7 @@ sequenceDiagram
     autonumber
     participant OP as Owner / Operator
     participant DIST as GameRewardsDistributor
-    participant PROXY as ScopedVaultProxy
+    participant MGR as ManagerWithMerkleVerification
     participant VAULT as BoringVault
     participant AAVE as Aave V3 Pool
 
@@ -144,13 +142,13 @@ sequenceDiagram
     OP->>DIST: supplyAndCheckpoint(amount)
     activate DIST
 
-    DIST->>PROXY: aaveSupplyUsdc(amount)
-    activate PROXY
-    PROXY->>VAULT: manage(usdc.approve(pool, amount))
-    PROXY->>VAULT: manage(pool.supply(USDC, amount, vault))
+    DIST->>MGR: manageVaultWithMerkleVerification<br/>(approve + supply proofs)
+    activate MGR
+    MGR->>VAULT: manage(usdc.approve(pool, amount))
+    MGR->>VAULT: manage(pool.supply(USDC, amount, vault, 0))
     VAULT->>AAVE: supply(USDC, amount, vault, 0)
     AAVE-->>VAULT: aUSDC minted to vault
-    deactivate PROXY
+    deactivate MGR
 
     DIST->>DIST: lastCheckpointBalance += amount
 
@@ -166,7 +164,7 @@ sequenceDiagram
     autonumber
     participant OP as Owner / Operator
     participant DIST as GameRewardsDistributor
-    participant PROXY as ScopedVaultProxy
+    participant MGR as ManagerWithMerkleVerification
     participant VAULT as BoringVault
     participant AAVE as Aave V3 Pool
     participant USER as Recipient
@@ -174,22 +172,52 @@ sequenceDiagram
     OP->>DIST: withdrawAndCheckpoint(amount, user)
     activate DIST
 
-    DIST->>PROXY: aaveWithdrawUsdc(amount)
-    activate PROXY
-    PROXY->>VAULT: manage(pool.withdraw)
+    DIST->>MGR: manageVaultWithMerkleVerification<br/>(withdraw + transfer proofs)
+    activate MGR
+    MGR->>VAULT: manage(pool.withdraw(USDC, amount, vault))
     VAULT->>AAVE: withdraw(USDC, amount, vault)
     AAVE-->>VAULT: USDC returned
-    deactivate PROXY
+    MGR->>VAULT: manage(usdc.transfer(distributor, amount))
+    VAULT-->>DIST: USDC transferred to distributor
+    deactivate MGR
 
-    DIST->>PROXY: vaultTransferUsdc(user, amount)
-    PROXY->>VAULT: manage(usdc.transfer(user, amount))
-    VAULT-->>USER: USDC
+    DIST->>USER: safeTransfer(USDC, user, amount)
 
     DIST->>DIST: lastCheckpointBalance -= amount
 
     Note over DIST: Atomic: checkpoint always<br/>matches actual Aave withdrawal.<br/>Withdrawal cannot create<br/>phantom negative yield.
 
     deactivate DIST
+```
+
+## Merkle Tree Structure
+
+```mermaid
+graph TB
+    ROOT["Merkle Root<br/><i>set via manager.setManageRoot(distributor, root)</i>"]
+
+    H01["Hash(Leaf0, Leaf1)"]
+    H23["Hash(Leaf2, Leaf3)"]
+
+    L0["Leaf 0: approve<br/><code>keccak256(decoder, USDC, approve.selector, [aavePool])</code>"]
+    L1["Leaf 1: supply<br/><code>keccak256(decoder, aavePool, supply.selector, [USDC, vault])</code>"]
+    L2["Leaf 2: withdraw<br/><code>keccak256(decoder, aavePool, withdraw.selector, [USDC, vault])</code>"]
+    L3["Leaf 3: transfer<br/><code>keccak256(decoder, USDC, transfer.selector, [distributor])</code>"]
+
+    ROOT --> H01
+    ROOT --> H23
+    H01 --> L0
+    H01 --> L1
+    H23 --> L2
+    H23 --> L3
+
+    classDef root fill:#e8eaf6,stroke:#283593
+    classDef internal fill:#e3f2fd,stroke:#1565c0
+    classDef leaf fill:#e8f5e9,stroke:#2e7d32
+
+    class ROOT root
+    class H01,H23 internal
+    class L0,L1,L2,L3 leaf
 ```
 
 ## Access Control (RolesAuthority)
@@ -200,7 +228,7 @@ graph LR
         GMR["GAME_MASTER_ROLE (20)"]
         OWR["OWNER_ROLE (8)"]
         MGR["MANAGER_ROLE (1)"]
-        DISTR["DISTRIBUTOR_ROLE (21)"]
+        STRAT["STRATEGIST_ROLE (21)"]
     end
 
     subgraph "GameRewardsDistributor Functions"
@@ -212,12 +240,11 @@ graph LR
         SPW["setProtocolWallet()"]
         SFS["setFeeSplits()"]
         SP["setPaused()"]
+        SMP["setMerkleProofs()"]
     end
 
-    subgraph "ScopedVaultProxy Functions"
-        AWU["aaveWithdrawUsdc()"]
-        ASU["aaveSupplyUsdc()"]
-        VTU["vaultTransferUsdc()"]
+    subgraph "ManagerWithMerkleVerification Functions"
+        MVM["manageVaultWithMerkleVerification()"]
     end
 
     subgraph "BoringVault Functions"
@@ -232,10 +259,9 @@ graph LR
     OWR -->|"can call"| SPW
     OWR -->|"can call"| SFS
     OWR -->|"can call"| SP
+    OWR -->|"can call"| SMP
 
-    DISTR -->|"can call"| AWU
-    DISTR -->|"can call"| ASU
-    DISTR -->|"can call"| VTU
+    STRAT -->|"can call"| MVM
 
     MGR -->|"can call"| MNG
 
@@ -243,16 +269,16 @@ graph LR
         direction LR
         A1["Game Master address → GAME_MASTER_ROLE"]
         A2["Owner address → OWNER_ROLE"]
-        A3["ScopedVaultProxy → MANAGER_ROLE"]
-        A4["GameRewardsDistributor → DISTRIBUTOR_ROLE"]
+        A3["ManagerWithMerkleVerification → MANAGER_ROLE"]
+        A4["GameRewardsDistributor → STRATEGIST_ROLE"]
     end
 
     classDef role fill:#e3f2fd,stroke:#1565c0
     classDef func fill:#f1f8e9,stroke:#558b2f
     classDef assignment fill:#fff8e1,stroke:#ff8f00
 
-    class GMR,OWR,MGR,DISTR role
-    class DR,SAC,WAC,AC,RC,SPW,SFS,SP,AWU,ASU,VTU,MNG func
+    class GMR,OWR,MGR,STRAT role
+    class DR,SAC,WAC,AC,RC,SPW,SFS,SP,SMP,MVM,MNG func
     class A1,A2,A3,A4 assignment
 ```
 

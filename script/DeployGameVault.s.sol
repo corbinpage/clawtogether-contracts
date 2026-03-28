@@ -89,7 +89,7 @@ contract DeployGameVault is Script {
 
     function _deployCore(address deployer, address owner) internal {
         _auth = new RolesAuthority(deployer, Authority(address(0)));
-        _vault = new BoringVault(deployer, "Game Yield Vault", "gyvUSDC", 6);
+        _vault = new BoringVault(deployer, "Game Yield Vault", "clawUSDC", 6);
         _vault.setAuthority(_auth);
 
         _manager = new ManagerWithMerkleVerification(deployer, address(_vault), address(0));
