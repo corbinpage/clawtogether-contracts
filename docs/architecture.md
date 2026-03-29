@@ -11,7 +11,6 @@ graph TB
     end
 
     subgraph Veda Arctic Architecture
-        TELLER["TellerWithMultiAssetSupport<br/><i>deposit & mint shares</i>"]
         ACCOUNTANT["AccountantWithRateProviders<br/><i>share pricing & exchange rates</i>"]
         DELAYED["DelayedWithdraw<br/><i>1-day withdrawal queue</i>"]
         VAULT["BoringVault<br/><i>holds aUSDC position</i><br/>clawUSDC shares"]
@@ -19,6 +18,7 @@ graph TB
     end
 
     subgraph ClawTogether Contracts
+        TELLER["ClawTogetherTeller<br/><i>deposit, depositFor & mint shares</i>"]
         DECODER["ClawTogetherDecoderAndSanitizer<br/><i>calldata address extraction</i>"]
         DIST["GameRewardsDistributor<br/><i>yield accounting & distribution</i>"]
     end
@@ -36,6 +36,7 @@ graph TB
     end
 
     USER -->|"deposit USDC"| TELLER
+    USER -->|"depositFor(asset, amount,<br/>onBehalfOf, referral)"| TELLER
     TELLER -->|"mint clawUSDC shares"| VAULT
     USER -->|"request withdrawal"| DELAYED
     DELAYED -->|"after 1-day delay<br/>burn shares, return USDC"| USER
@@ -71,8 +72,8 @@ graph TB
     classDef actor fill:#fffde7,stroke:#f9a825
 
     class GM,OW,USER actor
-    class TELLER,ACCOUNTANT,DELAYED,VAULT,MANAGER veda
-    class DECODER,DIST claw
+    class ACCOUNTANT,DELAYED,VAULT,MANAGER veda
+    class TELLER,DECODER,DIST claw
     class AAVE,USDC_TOK,AUSDC protocol
     class WINNERS,PROTOCOL,DEPOSITORS recipient
 ```
@@ -254,8 +255,8 @@ graph LR
     GMR -->|"can call"| DR
     GMR -->|"can call"| SAC
     GMR -->|"can call"| WAC
+    GMR -->|"can call"| RC
     OWR -->|"can call"| AC
-    OWR -->|"can call"| RC
     OWR -->|"can call"| SPW
     OWR -->|"can call"| SFS
     OWR -->|"can call"| SP
@@ -280,6 +281,30 @@ graph LR
     class GMR,OWR,MGR,STRAT role
     class DR,SAC,WAC,AC,RC,SPW,SFS,SP,SMP,MVM,MNG func
     class A1,A2,A3,A4 assignment
+```
+
+## Deposit-on-Behalf Flow (depositFor)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as User (depositor)
+    participant TELLER as ClawTogetherTeller
+    participant VAULT as BoringVault
+    participant R as Recipient (onBehalfOf)
+
+    U->>TELLER: depositFor(USDC, amount, onBehalfOf, referral)
+    activate TELLER
+
+    Note over TELLER: Checks: not paused,<br/>asset supported,<br/>onBehalfOf != address(0)
+
+    TELLER->>VAULT: enter(user, USDC, amount, onBehalfOf, shares)
+    Note over VAULT: Pull USDC from user<br/>Mint clawUSDC to onBehalfOf
+
+    TELLER-->>U: emit DepositFor(user, onBehalfOf, referral, amount, shares)
+    deactivate TELLER
+
+    Note over R: Recipient now holds<br/>clawUSDC shares
 ```
 
 ## Fee Split (Default: 80 / 10 / 10)

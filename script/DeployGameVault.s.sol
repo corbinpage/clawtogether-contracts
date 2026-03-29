@@ -11,6 +11,7 @@ import {AccountantWithRateProviders} from "boring-vault/base/Roles/AccountantWit
 import {DelayedWithdraw} from "boring-vault/base/Roles/DelayedWithdraw.sol";
 import {ManagerWithMerkleVerification} from "boring-vault/base/Roles/ManagerWithMerkleVerification.sol";
 import {ClawTogetherDecoderAndSanitizer} from "../src/ClawTogetherDecoderAndSanitizer.sol";
+import {ClawTogetherTeller} from "../src/ClawTogetherTeller.sol";
 import {GameRewardsDistributor} from "../src/GameRewardsDistributor.sol";
 
 /// @title DeployGameVault
@@ -58,6 +59,7 @@ contract DeployGameVault is Script {
     BoringVault internal _vault;
     ManagerWithMerkleVerification internal _manager;
     GameRewardsDistributor internal _distributor;
+    address internal _teller;
 
     function run() external {
         address deployer = msg.sender;
@@ -105,21 +107,23 @@ contract DeployGameVault is Script {
             deployer, address(_vault), owner, STARTING_EXCHANGE_RATE, address(USDC),
             ALLOWED_RATE_CHANGE_UPPER, ALLOWED_RATE_CHANGE_LOWER, MIN_UPDATE_DELAY, PLATFORM_FEE, PERFORMANCE_FEE
         );
-        TellerWithMultiAssetSupport teller = new TellerWithMultiAssetSupport(
+        ClawTogetherTeller teller_ = new ClawTogetherTeller(
             deployer, address(_vault), address(accountant), WETH
         );
+        _teller = address(teller_);
         DelayedWithdraw delayedWithdraw = new DelayedWithdraw(deployer, address(_vault), address(accountant), owner);
 
-        teller.setAuthority(_auth);
+        teller_.setAuthority(_auth);
         accountant.setAuthority(_auth);
         delayedWithdraw.setAuthority(_auth);
 
         // Teller permissions
-        _auth.setUserRole(address(teller), TELLER_ROLE, true);
+        _auth.setUserRole(address(teller_), TELLER_ROLE, true);
         _auth.setRoleCapability(TELLER_ROLE, address(_vault), bytes4(keccak256("enter(address,address,uint256,address,uint256)")), true);
-        _auth.setPublicCapability(address(teller), TellerWithMultiAssetSupport.deposit.selector, true);
-        teller.updateAssetData(ERC20(USDC), true, false, 0);
-        _vault.setBeforeTransferHook(address(teller));
+        _auth.setPublicCapability(address(teller_), TellerWithMultiAssetSupport.deposit.selector, true);
+        _auth.setPublicCapability(address(teller_), ClawTogetherTeller.depositFor.selector, true);
+        teller_.updateAssetData(ERC20(USDC), true, false, 0);
+        _vault.setBeforeTransferHook(address(teller_));
 
         // DelayedWithdraw permissions
         _auth.setUserRole(address(delayedWithdraw), DELAYED_WITHDRAW_ROLE, true);
@@ -130,12 +134,12 @@ contract DeployGameVault is Script {
         delayedWithdraw.setupWithdrawAsset(ERC20(USDC), WITHDRAW_DELAY, COMPLETION_WINDOW, WITHDRAW_FEE, MAX_LOSS);
         delayedWithdraw.setPullFundsFromVault(true);
 
-        teller.transferOwnership(owner);
+        teller_.transferOwnership(owner);
         accountant.transferOwnership(owner);
         delayedWithdraw.transferOwnership(owner);
 
         console.log("Accountant:", address(accountant));
-        console.log("Teller:", address(teller));
+        console.log("Teller:", address(teller_));
         console.log("DelayedWithdraw:", address(delayedWithdraw));
     }
 

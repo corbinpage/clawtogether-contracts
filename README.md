@@ -11,11 +11,12 @@ A DeFi game vault built on [Veda's Boring Vault](https://github.com/Se7en-Seas/b
 +--+--------+--------+--------+---------+--------+-----------------------+
    |        |        |        |         |        |
    v        v        v        v         v        v
-+------+ +------+ +------+ +--------+ +-------+ +----------+
-|Boring| |Accoun| |Teller| |Delayed | |Manager| |GameReward|
-|Vault | |tant  | |      | |Withdraw| |Merkle | |Distribut.|<-- GameMaster
-|(clawUSDC)       |      | |(1 day) | |Verify | |          |
-+------+ +------+ +------+ +--------+ +-------+ +----------+
++------+ +------+ +--------+ +--------+ +-------+ +----------+
+|Boring| |Accoun| |ClawTog.| |Delayed | |Manager| |GameReward|
+|Vault | |tant  | |Teller  | |Withdraw| |Merkle | |Distribut.|<-- GameMaster
+|(clawUSDC)       |deposit | |(1 day) | |Verify | |          |
++------+ +------+ |For()   | +--------+ +-------+ +----------+
+                   +--------+
    ^        |   enter()|  exit()  | manage() |      |
    +--------+----------+----------+----------+------+
 ```
@@ -24,8 +25,9 @@ A DeFi game vault built on [Veda's Boring Vault](https://github.com/Se7en-Seas/b
 
 **Depositing:**
 1. User approves USDC to the vault address
-2. User calls `teller.deposit(USDC, amount, minimumShares)`
-3. Teller calls `vault.enter()` -- USDC transfers in, `clawUSDC` shares mint to user
+2. User calls `teller.deposit(USDC, amount, minimumShares)` -- shares mint to caller
+3. Or calls `teller.depositFor(USDC, amount, onBehalfOf, referral)` -- shares mint to `onBehalfOf`
+4. Teller calls `vault.enter()` -- USDC transfers in, `clawUSDC` shares minted
 
 **Earning Yield:**
 1. Vault's USDC is supplied to Aave V3 (via ManagerWithMerkleVerification or external strategist)
@@ -52,9 +54,15 @@ ERC20 vault token (`clawUSDC`, 6 decimals) and asset custodian. Holds aUSDC and 
 
 Tracks the USDC/share exchange rate. Used by Teller for deposit pricing and DelayedWithdraw for slippage protection.
 
-### `TellerWithMultiAssetSupport` (Veda)
+### `ClawTogetherTeller` -- [`src/ClawTogetherTeller.sol`](src/ClawTogetherTeller.sol)
 
-Handles USDC deposits. Configured with deposits enabled, direct withdrawals disabled (use DelayedWithdraw). Also serves as the vault's `beforeTransferHook` for share lock enforcement.
+Extends Veda's `TellerWithMultiAssetSupport` with a `depositFor()` function for depositing on behalf of another address with optional referral tracking. Also handles regular USDC deposits. Configured with deposits enabled, direct withdrawals disabled (use DelayedWithdraw). Serves as the vault's `beforeTransferHook` for share lock enforcement.
+
+#### `depositFor(depositAsset, depositAmount, onBehalfOf, referral)`
+
+1. Pulls USDC from `msg.sender` (must approve vault)
+2. Mints `clawUSDC` shares to `onBehalfOf`
+3. Emits `DepositFor(depositor, onBehalfOf, referral, amount, shares)` -- referral is event-only, not stored
 
 ### `DelayedWithdraw` (Veda)
 
@@ -112,6 +120,7 @@ Core game logic. Tracks yield via aUSDC balance checkpoints and distributes on e
 ```
 User (Public)
   ├─ teller.deposit()
+  ├─ teller.depositFor(asset, amount, onBehalfOf, referral)
   ├─ delayedWithdraw.requestWithdraw()
   ├─ delayedWithdraw.cancelWithdraw()
   └─ delayedWithdraw.completeWithdraw()
@@ -176,7 +185,7 @@ forge build
 forge test -vvv
 ```
 
-47 unit tests (GameRewardsDistributor) + 8 integration tests (Teller deposit + DelayedWithdraw + game rewards).
+47 unit tests (GameRewardsDistributor) + 12 depositFor tests + 8 integration tests (Teller deposit + DelayedWithdraw + game rewards).
 
 ### Deploy
 
@@ -188,7 +197,7 @@ export GAME_MASTER=0x...
 forge script script/DeployGameVault.s.sol --rpc-url base --broadcast
 ```
 
-The deploy script handles the full system: BoringVault, Accountant, Teller, DelayedWithdraw, ManagerWithMerkleVerification, ClawTogetherDecoderAndSanitizer, GameRewardsDistributor, and all role/permission configuration.
+The deploy script handles the full system: BoringVault, Accountant, ClawTogetherTeller, DelayedWithdraw, ManagerWithMerkleVerification, ClawTogetherDecoderAndSanitizer, GameRewardsDistributor, and all role/permission configuration.
 
 **Post-deploy (owner must do manually):**
 1. Compute Merkle tree (4 leaves: approve, supply, withdraw, transfer)
